@@ -935,7 +935,7 @@ async def web_search_query(
                     data = await resp.json()
                 raw_results = data.get("results", [])[:max_results]
                 return [
-                    {"id": f"web-{i}", "source": r.get("url", "web"),
+                    {"id": f"web-{i}", "source": r.get("url", "web"), "title": r.get("title", ""),
                      "text": clean_web_text(r.get("content", "")),
                      "similarity_score": float(r.get("score", 0.5))}
                     for i, r in enumerate(raw_results)
@@ -950,7 +950,7 @@ async def web_search_query(
                     data = await resp.json()
                 raw_results = data.get("organic", [])[:max_results]
                 return [
-                    {"id": f"web-{i}", "source": r.get("link", "web"),
+                    {"id": f"web-{i}", "source": r.get("link", "web"), "title": r.get("title", ""),
                      "text": clean_web_text(r.get("snippet", "")),
                      "similarity_score": max(0.5, 0.9 - 0.05 * i)}
                     for i, r in enumerate(raw_results)
@@ -965,7 +965,7 @@ async def web_search_query(
                     data = await resp.json()
                 raw_results = data.get("webPages", {}).get("value", [])[:max_results]
                 return [
-                    {"id": f"web-{i}", "source": r.get("url", "web"),
+                    {"id": f"web-{i}", "source": r.get("url", "web"), "title": r.get("name", ""),
                      "text": clean_web_text(r.get("snippet", "")),
                      "similarity_score": max(0.5, 0.9 - 0.05 * i)}
                     for i, r in enumerate(raw_results)

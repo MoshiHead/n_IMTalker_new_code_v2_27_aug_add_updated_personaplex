@@ -12,6 +12,7 @@ import base64
 import concurrent.futures
 import contextlib
 import json
+import logging
 import os
 import queue
 
@@ -43,6 +44,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import runtime_logging
 from experiments.original_pod_8998.FM import FMGenerator
 from generator.train_lora import apply_lora_to_model
 from generator.helium_w2v_frontend_adapter import HeliumToWav2VecFrontendAdapter
@@ -538,6 +540,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.suppress_text_until_ref = False
         self._pending_ref_token_counts = (0, 0)
         self.search_filler_frame_count = 0
+        # Whether the thinking-sound suppression path was engaged for the turn
+        # currently in flight -- read by turn_flags() when that turn's final
+        # response is logged. Reset per turn in _start_turn / _begin_casual_turn.
+        self._turn_used_thinking_sound = False
         self.search_session_history: list[tuple[str, str]] = []
         self.search_current_transcript = ""
         # Snapshot of len(self.audio_text) at turn start (when the user STOPPED
@@ -595,6 +601,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         background thread, and both can land for the same turn."""
         if self.suppress_text_during_search:
             self.suppress_text_until_ref = True
+        # Recorded regardless of thinking_sound_pcm below: this flag answers
+        # "did this turn wait on a search" for the conversation log, which is
+        # true even when there is no audio clip configured to cover the wait.
+        self._turn_used_thinking_sound = True
         if self.thinking_sound_pcm is None or self.search_thinking_active:
             return
         self.search_thinking_active = True
@@ -700,6 +710,17 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     self.conv_logger.narrate_response(
                         self.search_turn_epoch, self.search_current_transcript, prev_response
                     )
+                    # avatar_streaming_active is True here by construction: this
+                    # hook only runs inside the reply-generation engine that
+                    # feeds the avatar/audio pipeline, never in a code path
+                    # without it. thinking_sound_played reflects whether this
+                    # turn actually covered a wait with the filler clip.
+                    self.conv_logger.turn_flags(
+                        self.search_turn_epoch,
+                        ref_lora_active=bool(getattr(self, "ref_lora_dir", "")),
+                        avatar_streaming_active=True,
+                        thinking_sound_played=bool(getattr(self, "_turn_used_thinking_sound", False)),
+                    )
                     self._finish_turn_latency(prev_response)
                     if self.search_current_transcript:
                         self.search_session_history.append((self.search_current_transcript, prev_response))
@@ -768,6 +789,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         no search, no injection, nothing added to the context."""
         self.search_turn_epoch += 1
         self.search_current_transcript = transcript
+        self._turn_used_thinking_sound = False
         self._turn_start_audio_text_len = len(self.audio_text)
         self._turn_awaiting_first_speech = True
         self._turn_first_speech_epoch = self.search_turn_epoch
@@ -837,6 +859,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.search_ref_committed_this_turn = False
         self.search_awaiting_ref = True
         self.search_filler_frame_count = 0
+        self._turn_used_thinking_sound = False
         self.search_current_transcript = transcript
         self.pending_lookup_tokens = None
         self.pending_ref_tokens = None
@@ -961,15 +984,32 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     self.web_search_max_results, self.web_search_timeout,
                 )
                 web_elapsed = time.perf_counter() - t_web0
+                # web_search_query/_sync always return [] on any failure (bad
+                # response, exception, or timeout) rather than raising -- see
+                # search_helpers.py -- so "why zero results" is inferred here
+                # from elapsed time against the configured timeout, not a
+                # distinct error channel.
+                if web_hits:
+                    search_status = "success"
+                elif web_elapsed >= self.web_search_timeout * 0.95:
+                    search_status = "timeout"
+                else:
+                    search_status = "empty_results"
                 self._turn_timing_stages["web_search"] = web_elapsed
                 self.conv_logger.latency.stage(
                     my_epoch, "web_search", web_elapsed,
-                    note=f"{self.web_search_provider}: {len(web_hits)} result(s)",
+                    note=f"{self.web_search_provider}: {len(web_hits)} result(s), status={search_status}",
                 )
                 self.conv_logger.latency.mark(my_epoch, "search_done")
                 self.conv_logger.web_search(
                     transcript, self.web_search_provider, len(web_hits), web_elapsed,
                     triggered_reason="router decided live data was required",
+                )
+                runtime_logging.log_event(
+                    runtime_logging.get_system_logger(), "WebSearch", "query_complete",
+                    level=(logging.WARNING if search_status != "success" else logging.INFO),
+                    provider=self.web_search_provider, status=search_status,
+                    n_results=len(web_hits), elapsed_s=round(web_elapsed, 3),
                 )
                 t_filter0 = time.perf_counter()
                 relevant = [h for h in web_hits if h.get("similarity_score", 0.0) >= self.web_search_min_score]
@@ -988,7 +1028,8 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     web_result_chars=sum(len(str(h.get("text", ""))) for h in hits),
                 )
                 self.conv_logger.turn_search(
-                    my_epoch, self.web_search_provider, len(web_hits), len(hits), web_elapsed
+                    my_epoch, self.web_search_provider, len(web_hits), len(hits), web_elapsed,
+                    status=search_status,
                 )
                 self.conv_logger.retrieval(transcript, "web", hits, web_elapsed)
                 self.conv_logger.narrate_web_search_results(
@@ -1596,35 +1637,47 @@ def _clean_generator_state(ckpt: dict) -> dict:
 
 
 def _load_fm(args: argparse.Namespace, device: torch.device) -> FMGenerator:
+    syslog = runtime_logging.get_system_logger()
     t_total = time.perf_counter()
-    fm = FMGenerator(args).to(device).eval()
-    ckpt = torch.load(args.generator_path, map_location="cpu")
-    cleaned = _clean_generator_state(ckpt)
-    missing, unexpected = fm.load_state_dict(cleaned, strict=False)
+    with runtime_logging.Timer(
+        syslog, "IMTalker.FMGenerator", "load_base",
+        path=args.generator_path, device=str(device),
+    ):
+        fm = FMGenerator(args).to(device).eval()
+        ckpt = torch.load(args.generator_path, map_location="cpu")
+        cleaned = _clean_generator_state(ckpt)
+        missing, unexpected = fm.load_state_dict(cleaned, strict=False)
     print(
         f"[liveTryHeliumFM][FM] base loaded missing={len(missing)} unexpected={len(unexpected)}",
         flush=True,
     )
     lora_path = str(getattr(args, "lora_generator_path", "") or "")
     if lora_path:
-        apply_lora_to_model(
-            fm,
-            rank=int(getattr(args, "lora_rank", 64) or 64),
-            alpha=float(getattr(args, "lora_alpha", 128) or 128),
-            dropout=float(getattr(args, "lora_dropout", 0.05)),
-            include_pose_lora=not bool(getattr(args, "no_lora_pose_projection", False)),
-            include_audio_lora=not bool(getattr(args, "no_lora_audio_projection", False)),
-            only_pose_lora=bool(getattr(args, "only_lora_pose_projection", False)),
-        )
-        lora_ckpt = torch.load(lora_path, map_location="cpu")
-        lora_cleaned = _clean_generator_state(lora_ckpt)
-        missing_lora, unexpected_lora = fm.load_state_dict(lora_cleaned, strict=False)
-        lora_keys = sum(1 for key in lora_cleaned if "lora_" in key)
+        with runtime_logging.Timer(
+            syslog, "IMTalker.AvatarMotionLoRA", "load",
+            name="ditto_blink_lora", path=lora_path, base_model="FMGenerator",
+            device=str(device), rank=int(getattr(args, "lora_rank", 64) or 64),
+        ):
+            apply_lora_to_model(
+                fm,
+                rank=int(getattr(args, "lora_rank", 64) or 64),
+                alpha=float(getattr(args, "lora_alpha", 128) or 128),
+                dropout=float(getattr(args, "lora_dropout", 0.05)),
+                include_pose_lora=not bool(getattr(args, "no_lora_pose_projection", False)),
+                include_audio_lora=not bool(getattr(args, "no_lora_audio_projection", False)),
+                only_pose_lora=bool(getattr(args, "only_lora_pose_projection", False)),
+            )
+            lora_ckpt = torch.load(lora_path, map_location="cpu")
+            lora_cleaned = _clean_generator_state(lora_ckpt)
+            missing_lora, unexpected_lora = fm.load_state_dict(lora_cleaned, strict=False)
+            lora_keys = sum(1 for key in lora_cleaned if "lora_" in key)
         print(
             f"[liveTryHeliumFM][FM] lora loaded path={lora_path} "
             f"lora_keys={lora_keys} missing={len(missing_lora)} unexpected={len(unexpected_lora)}",
             flush=True,
         )
+    else:
+        runtime_logging.log_event(syslog, "IMTalker.AvatarMotionLoRA", "not_configured")
     fm.to(device).eval()
     _sync_cuda()
     print(f"[liveTryHeliumFM][FM] loaded in {_ms(t_total):.0f}ms", flush=True)
@@ -1632,22 +1685,27 @@ def _load_fm(args: argparse.Namespace, device: torch.device) -> FMGenerator:
 
 
 def _load_renderer(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> IMTRenderer:
+    syslog = runtime_logging.get_system_logger()
     t_total = time.perf_counter()
-    renderer = IMTRenderer(args).to(device).eval()
-    ckpt = torch.load(args.renderer_path, map_location="cpu")
-    raw = ckpt.get("state_dict", ckpt.get("model", ckpt))
-    cleaned = {k.replace("gen.", "", 1).replace("model.", "", 1): v for k, v in raw.items()}
-    missing, unexpected = renderer.load_state_dict(cleaned, strict=False)
-    renderer = renderer.to(dtype=dtype)
-    _sync_cuda()
-    if getattr(args, "compile_renderer", False):
-        @torch.no_grad()
-        def _fused_render(motion_latent, g_r, m_r, f_r):
-            ta_c = renderer.adapt(motion_latent, g_r)
-            m_c = renderer.latent_token_decoder(ta_c)
-            frames = renderer.decode(m_c, m_r, f_r)
-            return frames
-        renderer._fused_render = torch.compile(_fused_render)
+    with runtime_logging.Timer(
+        syslog, "IMTalker.Renderer", "load",
+        path=args.renderer_path, device=str(device), dtype=str(dtype),
+    ):
+        renderer = IMTRenderer(args).to(device).eval()
+        ckpt = torch.load(args.renderer_path, map_location="cpu")
+        raw = ckpt.get("state_dict", ckpt.get("model", ckpt))
+        cleaned = {k.replace("gen.", "", 1).replace("model.", "", 1): v for k, v in raw.items()}
+        missing, unexpected = renderer.load_state_dict(cleaned, strict=False)
+        renderer = renderer.to(dtype=dtype)
+        _sync_cuda()
+        if getattr(args, "compile_renderer", False):
+            @torch.no_grad()
+            def _fused_render(motion_latent, g_r, m_r, f_r):
+                ta_c = renderer.adapt(motion_latent, g_r)
+                m_c = renderer.latent_token_decoder(ta_c)
+                frames = renderer.decode(m_c, m_r, f_r)
+                return frames
+            renderer._fused_render = torch.compile(_fused_render)
     print(
         f"[liveTryHeliumFM][renderer] loaded in {_ms(t_total):.0f}ms "
         f"missing={len(missing)} unexpected={len(unexpected)}",
@@ -1794,6 +1852,8 @@ class LiveHeliumFMEngine:
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")
 
+        _t_engine_init = time.perf_counter()
+        _syslog = runtime_logging.get_system_logger()
         self.args = args
         self.device = torch.device(args.device)
         renderer_precision = str(
@@ -1867,6 +1927,11 @@ class LiveHeliumFMEngine:
             f"path={args.adapter_path}",
             flush=True,
         )
+        runtime_logging.log_event(
+            _syslog, "IMTalker.StudioAdapter", "loaded",
+            adapter_type=args.adapter_type, path=args.adapter_path,
+            device=str(self.device), duration_ms=round(_ms(t_adapter), 1),
+        )
 
         # Raw HF Wav2Vec2 target path used during Helium adapter training.
         t_w2v = time.perf_counter()
@@ -1880,6 +1945,11 @@ class LiveHeliumFMEngine:
             f"[liveTryHeliumStudioFM][wav2vec] loaded in {_ms(t_w2v):.0f}ms "
             f"path={args.wav2vec_model_path}",
             flush=True,
+        )
+        runtime_logging.log_event(
+            _syslog, "IMTalker.Wav2Vec2", "loaded",
+            path=args.wav2vec_model_path, device=str(self.device),
+            duration_ms=round(_ms(t_w2v), 1),
         )
 
         # Reference image: pre-compute identity + motion-ref features once
@@ -1954,6 +2024,9 @@ class LiveHeliumFMEngine:
                 f"{silence_helium_path}",
                 flush=True,
             )
+            runtime_logging.log_event(
+                _syslog, "IMTalker.SilenceHeliumSeed", "loaded", path=silence_helium_path,
+            )
         self._pcm_accum: np.ndarray = np.empty(0, dtype=np.float32)
         self.dump_motion = bool(getattr(args, "dump_motion", False))
         self.dump_dir = Path(getattr(args, "dump_dir", ROOT / "live_try_dumps"))
@@ -1981,6 +2054,26 @@ class LiveHeliumFMEngine:
             f"fm_chunk={self.fm_chunk_frames} render_sub={self.render_sub_batch} "
             f"dtype={self.dtype}",
             flush=True,
+        )
+        gpu_fields: dict = {}
+        if torch.cuda.is_available():
+            idx = torch.cuda.current_device()
+            free_b, total_b = torch.cuda.mem_get_info(idx)
+            gpu_fields = {
+                "gpu_name": torch.cuda.get_device_name(idx),
+                "cuda_version": torch.version.cuda,
+                "vram_total_gb": round(total_b / (1024 ** 3), 2),
+                "vram_free_gb": round(free_b / (1024 ** 3), 2),
+            }
+        runtime_logging.log_event(
+            _syslog, "IMTalker.LiveHeliumFMEngine", "ready",
+            duration_ms=round((time.perf_counter() - _t_engine_init) * 1000.0, 1),
+            device=str(self.device), dtype=str(self.dtype),
+            fm_chunk_frames=self.fm_chunk_frames, render_sub_batch=self.render_sub_batch,
+            avatar_ref_path=str(getattr(args, "ref_path", "")),
+            renderer_path=str(getattr(args, "renderer_path", "")),
+            generator_path=str(getattr(args, "generator_path", "")),
+            **gpu_fields,
         )
 
     def _init_moshi(self, args: argparse.Namespace) -> None:
@@ -4340,6 +4433,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    syslog = runtime_logging.get_system_logger()
+    runtime_logging.log_event(
+        syslog, "Server", "startup_begin",
+        logs_dir=str(runtime_logging.logs_dir()),
+        torch_version=torch.__version__,
+        cuda_available=torch.cuda.is_available(),
+        cuda_version=torch.version.cuda,
+    )
     parser = LiveHeliumFMOptions()
     args = parser.parse()
     args.rank = args.device
@@ -4351,6 +4452,11 @@ def main() -> None:
 
     print(f"[liveTryHeliumFM_ws_binary] serving {args.html_path} (binary av_transport)")
     print(f"[liveTryHeliumFM] open http://{args.host}:{args.port}/")
+    runtime_logging.log_event(
+        syslog, "Server", "listening",
+        host=args.host, port=args.port, html_path=args.html_path,
+        search_enabled=bool(getattr(args, "stt_hf_repo", "") and getattr(args, "compressor_model", "")),
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

@@ -44,6 +44,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import runtime_logging  # IMTalker/ is on sys.path by the time this runs
+
 
 class _NullLatency:
     """Stand-in used when latency_logger.py cannot be imported. Accepts and
@@ -71,27 +73,6 @@ class ConversationLogger:
         # session, not per-request) -- "how many times online search is
         # performed".
         self.web_search_count = 0
-
-        # Dedicated latency/timing log, sharing this session's id and directory
-        # so `conversation_<s>.log`, `detailed_<s>.log` and `latency_<s>.log`
-        # always describe the same run and can be read side by side. Created
-        # unconditionally: with no log_dir it degrades to a no-op object, so
-        # call sites never need to check whether it exists.
-        # The import is guarded rather than assumed: this module is imported
-        # from inside the live engine's constructor, so an older checkout
-        # without latency_logger.py must lose the timing log, not the whole
-        # server. _NullLatency swallows every call site below.
-        try:
-            from latency_logger import LatencyLogger  # IMTalker/ is on sys.path by the time this runs
-
-            self.latency: Any = LatencyLogger(log_dir=self.log_dir, session_id=self.session_id)
-        except Exception as e:
-            print(
-                f"[conversation_logger] latency logging disabled ({e!r}) -- "
-                f"conversation logging is unaffected",
-                flush=True,
-            )
-            self.latency = _NullLatency()
 
         self.logger = logging.getLogger(f"conversation.{id(self)}")
         self.logger.setLevel(logging.INFO)
@@ -137,6 +118,38 @@ class ConversationLogger:
                     flush=True,
                 )
 
+            # Fixed-path logs/conversation.log: unconditional (unlike the
+            # per-session files above, which need log_dir set), rotating, and
+            # unified across every server run -- this is what shows the full
+            # USER -> SEARCH DECISION -> ... -> PERSONAPLEX RESPONSE flow with
+            # a conversation_id on every line, independent of session naming.
+            runtime_logging.attach_conversation_file(self.logger)
+
+        # Dedicated latency/timing log, sharing this session's id and directory
+        # so `conversation_<s>.log`, `detailed_<s>.log` and `latency_<s>.log`
+        # always describe the same run and can be read side by side. Created
+        # unconditionally: with no log_dir it degrades to a no-op object, so
+        # call sites never need to check whether it exists. `mirror_logger`
+        # makes every per-stage timing line ALSO land in the fixed
+        # logs/conversation.log above, with no duplicated computation.
+        # The import is guarded rather than assumed: this module is imported
+        # from inside the live engine's constructor, so an older checkout
+        # without latency_logger.py must lose the timing log, not the whole
+        # server. _NullLatency swallows every call site below.
+        try:
+            from latency_logger import LatencyLogger  # IMTalker/ is on sys.path by the time this runs
+
+            self.latency: Any = LatencyLogger(
+                log_dir=self.log_dir, session_id=self.session_id, mirror_logger=self.logger,
+            )
+        except Exception as e:
+            print(
+                f"[conversation_logger] latency logging disabled ({e!r}) -- "
+                f"conversation logging is unaffected",
+                flush=True,
+            )
+            self.latency = _NullLatency()
+
     # -- low-level ---------------------------------------------------------
 
     def _write_jsonl(self, record: dict[str, Any]) -> None:
@@ -158,7 +171,7 @@ class ConversationLogger:
         extra = " ".join(f"{k}={v!r}" for k, v in fields.items() if v is not None)
         if extra:
             line = f"{line} {extra}"
-        self.logger.info(line)
+        self.logger.info(line, extra={"conversation_id": self.session_id})
         self._write_jsonl({"kind": kind, "summary": summary, **fields})
 
     @staticmethod
@@ -206,7 +219,10 @@ class ConversationLogger:
     _STAGE_W = 8
 
     def _turn(self, turn_id: Any, stage: str, text: str, kind: str, **fields: Any) -> None:
-        self.logger.info(f"TURN {turn_id} | {stage:<{self._STAGE_W}} | {text}")
+        self.logger.info(
+            f"TURN {turn_id} | {stage:<{self._STAGE_W}} | {text}",
+            extra={"conversation_id": self.session_id},
+        )
         self._write_jsonl({"kind": kind, "turn": turn_id, **fields})
 
     def turn_heard(
@@ -259,16 +275,25 @@ class ConversationLogger:
             score=round(float(score), 4), elapsed_s=round(float(elapsed_s), 4), reason=reason,
         )
         if reason:
-            self.logger.info(f"TURN {turn_id} | {'':<{self._STAGE_W}} | why: {reason}")
+            self.logger.info(
+                f"TURN {turn_id} | {'':<{self._STAGE_W}} | why: {reason}",
+                extra={"conversation_id": self.session_id},
+            )
 
     def turn_search(
         self, turn_id: Any, provider: str, n_found: int, n_kept: int, elapsed_s: float,
+        status: str = "success",
     ) -> None:
+        """`status` is one of 'success', 'empty_results', or 'timeout' -- see
+        the heuristic in _route_and_search (web_search_query/_sync always
+        return [] on failure, so this is inferred from the result count and
+        elapsed time against the configured timeout, not a distinct error
+        channel from search_helpers.py)."""
         self._turn(
             turn_id, "SEARCH",
-            f"{provider}: {n_found} found, {n_kept} kept ({elapsed_s:.2f}s)",
+            f"{provider}: {n_found} found, {n_kept} kept, status={status} ({elapsed_s:.2f}s)",
             "turn_search",
-            provider=provider, n_found=n_found, n_kept=n_kept,
+            provider=provider, n_found=n_found, n_kept=n_kept, status=status,
             elapsed_s=round(float(elapsed_s), 3),
         )
 
@@ -314,6 +339,25 @@ class ConversationLogger:
             "assistant_reply", response=response,
         )
 
+    def turn_flags(
+        self, turn_id: Any, ref_lora_active: bool, avatar_streaming_active: bool,
+        thinking_sound_played: bool = False,
+    ) -> None:
+        """One consolidated per-turn line for the flags that don't change
+        mid-turn: whether the <lookup>/<ref> LoRA is loaded (it's a
+        startup-time, all-turns-or-none setting, logged here per turn anyway
+        so a single turn's log block is self-contained), and whether the
+        avatar/video streaming pipeline was live for this turn."""
+        self._turn(
+            turn_id, "FLAGS",
+            f"ref_lora_active={ref_lora_active} avatar_streaming_active={avatar_streaming_active} "
+            f"thinking_sound_played={thinking_sound_played}",
+            "turn_flags",
+            ref_lora_active=bool(ref_lora_active),
+            avatar_streaming_active=bool(avatar_streaming_active),
+            thinking_sound_played=bool(thinking_sound_played),
+        )
+
     def quick_gate_timing(self, elapsed_s: float) -> None:
         """The instant regex pre-pass done synchronously on the GPU thread to
         decide whether a turn even needs the model router -- timed separately
@@ -347,7 +391,8 @@ class ConversationLogger:
 
     def retrieval(self, transcript: str, source: str, hits: list[dict], elapsed_s: float) -> None:
         preview = [
-            {"source": h.get("source"), "score": round(float(h.get("similarity_score", 0.0)), 4),
+            {"title": h.get("title", ""), "source": h.get("source"),
+             "score": round(float(h.get("similarity_score", 0.0)), 4),
              "text": str(h.get("text", ""))[:200]}
             for h in hits
         ]

@@ -112,6 +112,10 @@ fi
 required=(
  "$VENV_DIR/bin/python"
  "$IM/imtalker_personaplex_try_vad2_8998.py" "$IM/seedvc_runtime.py" "$IM/liveTry.py" "$IM/liveTry_cached.py" "$IM/ws_av_binary_codec.py"
+ # runtime_logging.py and conversation_logger.py are imported unconditionally
+ # by liveTry.py/liveTry_cached.py regardless of ENABLE_SEARCH -- a missing
+ # file here is an ImportError at engine construction, not a degraded mode.
+ "$IM/runtime_logging.py" "$IM/conversation_logger.py" "$IM/latency_logger.py"
  "$IM/experiments/original_pod_8998/FM.py" "$IM/experiments/original_pod_8998/FMT.py"
  "$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html" "$IM/static/assets/robert_idle_10s.mp4" "$IM/static/assets/audio-processor-aj-nodrop.js"
  "$IM/static/assets/decoderWorker.min.js" "$IM/static/assets/decoderWorker.min.wasm" "$IM/static/assets/encoderWorker.min-DpsJ02BN.js"
@@ -128,16 +132,15 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     exit 1
   }
   [[ -e "$IM/search_helpers.py" ]] || { echo "Missing required search path: $IM/search_helpers.py" >&2; exit 1; }
-  [[ -e "$IM/conversation_logger.py" ]] || { echo "Missing required search path: $IM/conversation_logger.py" >&2; exit 1; }
 fi
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="0d885e8b36f479848cd5e8fef9fe0290440eb44a88cd997c58fccdc7465e11d3"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="34f796b7fb6df670806645900e91b514fd1808688a8608965ca6a192fa822df3"
  ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"
  ["$IM/experiments/original_pod_8998/FMT.py"]="286eb512e710926b0a88d1bc47f14aef5cfc3ef6fc0987fc3cf0d9e7bd004c5d"
- ["$IM/liveTry.py"]="ec5bf0cfb115eed64fe67c75d479752828d24b99bfc7d2a003186b305d8af637"
- ["$IM/liveTry_cached.py"]="61fab36e08cd76d7ef55a7ea834c84395c72d83c722607fea1d595536385957b"
+ ["$IM/liveTry.py"]="201ee853c21e6b0b9b4dc590928734e2236ef11c69d1143afa80257333b46935"
+ ["$IM/liveTry_cached.py"]="32e6818c7f7e138323e9eabe7f21cca365a4828893154af043b9c040f89dbf2e"
  ["$IM/seedvc_runtime.py"]="fe46773af65e010e3d6f41732f0fa1c3e3cf6a8221d9c68718e15561062337f7"
  ["$IM/ws_av_binary_codec.py"]="c090b6a5a076743055f1dd34301662405a28d5cb1636556e9de4c895ddffe4d3"
  ["$BNB/voices/Robert_5.pt"]="a9684503d2a9d37f527341c9a0385b9ed0943eac955b40159bc34f4796563c3d"
@@ -155,11 +158,17 @@ assert torch.cuda.is_available(), "CUDA is unavailable"
 assert torch.__version__.startswith("2.8.0+cu128"), torch.__version__
 print("CUDA:", torch.cuda.get_device_name(0)); print("Torch:", torch.__version__)
 PY
-python -m py_compile "$IM/imtalker_personaplex_try_vad2_8998.py" "$IM/seedvc_runtime.py" "$IM/liveTry.py" "$IM/liveTry_cached.py" "$IM/experiments/original_pod_8998/FM.py" "$IM/experiments/original_pod_8998/FMT.py"
+python -m py_compile "$IM/imtalker_personaplex_try_vad2_8998.py" "$IM/seedvc_runtime.py" "$IM/liveTry.py" "$IM/liveTry_cached.py" "$IM/experiments/original_pod_8998/FM.py" "$IM/experiments/original_pod_8998/FMT.py" "$IM/runtime_logging.py" "$IM/conversation_logger.py" "$IM/latency_logger.py" "$IM/search_helpers.py"
 echo "Preflight OK: try_vad2, $VOICE_PROMPT, prompt cache=$PROMPT_CACHE, 2.0s/25-step chunks, 50 frames, CFG 1.24, NFE 3, renderer sub-batch 6, FP32, Opus. search=$ENABLE_SEARCH web_search=${WEB_SEARCH_ENABLED:-0}"
 [[ "$CHECK_ONLY" -eq 1 ]] && exit 0
 if ss -ltnp | grep -q ":${PORT}\\b"; then echo "Port $PORT is occupied:" >&2; ss -ltnp | grep ":${PORT}\\b" >&2; exit 1; fi
-mkdir -p "$IM/logs" "$ROOT/pacing_compare/integrated"
+# LOGS_DIR: where runtime_logging.py (system_runtime.log, conversation.log)
+# writes, independent of $IM/logs above (which is unrelated, pre-existing
+# scratch space). Exported explicitly so it resolves correctly regardless of
+# whether SPEECH2AVATAR_ROOT happens to be set in the caller's environment.
+export LOGS_DIR="${LOGS_DIR:-$ROOT/logs}"
+export SPEECH2AVATAR_ROOT="$ROOT"
+mkdir -p "$IM/logs" "$LOGS_DIR" "$ROOT/pacing_compare/integrated"
 cd "$IM"
 export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONPATH="$IM:$BNB/moshi:$BNB:${PYTHONPATH:-}"

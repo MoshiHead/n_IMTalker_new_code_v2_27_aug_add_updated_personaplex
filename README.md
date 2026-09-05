@@ -1,2 +1,2 @@
-# n_IMTalker_new_code_v2_27_aug_add_updated_personaplex
-add online search and summary and injection system
+# n_IMTalker_new_code_v2_27_aug
+new code run without updated personaplex 27 aug try (ipynb base on lora v2)

@@ -104,11 +104,18 @@ class TurnLatency:
 
 
 class LatencyLogger:
-    def __init__(self, log_dir: str = "", session_id: str = "") -> None:
+    def __init__(self, log_dir: str = "", session_id: str = "", mirror_logger: Any = None) -> None:
         self.session_id = session_id or time.strftime("%Y%m%d_%H%M%S")
         self.log_dir = str(log_dir or "")
         self.path: str | None = None
         self.jsonl_path: str | None = None
+        # Optional stdlib `logging.Logger` (conversation_logger.py's own
+        # logger) that every line written below is ALSO sent to, via
+        # `logger.info(...)`. This is what makes latency/timing data show up
+        # in the unified logs/conversation.log file -- see
+        # runtime_logging.attach_conversation_file -- without this module
+        # duplicating any of conversation_logger.py's file-handling logic.
+        self._mirror = mirror_logger
         self._lock = threading.RLock()
         self._turns: dict[Any, TurnLatency] = {}
         self._order: list[Any] = []
@@ -156,6 +163,13 @@ class LatencyLogger:
         return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"
 
     def _write(self, text: str) -> None:
+        if self._mirror is not None:
+            try:
+                stripped = text.strip("\n")
+                if stripped:
+                    self._mirror.info(stripped, extra={"conversation_id": self.session_id})
+            except Exception:
+                pass  # mirroring must never break the pipeline or the primary log below
         if not self.path:
             return
         try:

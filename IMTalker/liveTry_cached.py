@@ -21,6 +21,7 @@ import base64
 import contextlib
 from dataclasses import fields, is_dataclass
 import json
+import logging
 import os
 import sys
 import tarfile
@@ -34,6 +35,8 @@ import torch
 import torchaudio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+import runtime_logging  # IMTalker/ is on sys.path by the time this runs
 
 
 TARGET_SR = 24000
@@ -228,6 +231,12 @@ class MoshiOnlyEngine:
             "[liveTry] loading Moshi "
             f"repo={mimi_hf_repo} root={moshi_root} device={self.device} cfg={cfg_coef}"
         )
+        syslog = runtime_logging.get_system_logger()
+        runtime_logging.log_event(
+            syslog, "PersonaPlex", "load_start",
+            source=mimi_hf_repo, moshi_root=moshi_root, device=str(self.device),
+            dtype="bfloat16", quantize_4bit=bool(quantize_4bit),
+        )
         t0 = time.perf_counter()
         if hasattr(loaders, "CheckpointInfo"):
             ckpt_info = loaders.CheckpointInfo.from_hf_repo(mimi_hf_repo)
@@ -259,6 +268,15 @@ class MoshiOnlyEngine:
             self.lm = loaders.get_moshi_lm(moshi_weight, **lm_kwargs)
             self.tokenizer = sentencepiece.SentencePieceProcessor(tokenizer)  # type: ignore
             model_type = "personaplex"
+
+        runtime_logging.log_event(
+            syslog, "PersonaPlex", "load_done",
+            source=mimi_hf_repo, model_type=model_type, device=str(self.device),
+            lm_dtype=str(next(self.lm.parameters()).dtype), quantize_4bit=bool(quantize_4bit),
+            moshi_weight=moshi_weight or "(from repo)", mimi_weight=mimi_weight or "(from repo)",
+            tokenizer_path=tokenizer or "(from repo)",
+            duration_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+        )
 
         # The reference LoRA must be applied here: after the base LM is loaded,
         # before LMGen(...)/CUDA-graph capture below (and before the prompt
@@ -382,10 +400,15 @@ class MoshiOnlyEngine:
         base, not merged into the quantized weights). PEFT mutates self.lm's
         target submodules in place -- self.lm keeps pointing at the same, now
         LoRA-augmented, object either way."""
+        syslog = runtime_logging.get_system_logger()
         lora_path = Path(checkpoint_dir) / "lora"
         if not lora_path.exists():
             print(f"[liveTry] no lora/ at {lora_path} -- skipping", flush=True)
+            runtime_logging.log_event(
+                syslog, "RefLoRA", "not_found", level=logging.WARNING, path=str(lora_path),
+            )
             return
+        t0 = time.perf_counter()
         try:
             from peft import PeftModel
 
@@ -394,10 +417,20 @@ class MoshiOnlyEngine:
             if merge_lora:
                 self.lm = peft_model.merge_and_unload()
             print(f"[liveTry] reference LoRA loaded from {lora_path}", flush=True)
+            runtime_logging.log_event(
+                syslog, "RefLoRA", "loaded",
+                name="helium_lora_v1 (<lookup>/<ref> adapter)", path=str(lora_path),
+                base_model="PersonaPlex LM", device=str(self.device),
+                merged=bool(merge_lora), status="ok",
+                duration_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[liveTry] reference LoRA load failed (continuing without it): {e!r}\n{tb}", flush=True)
             self.conv_logger.error("ref_lora_load", e, tb)
+            runtime_logging.log_event(
+                syslog, "RefLoRA", "load_failed", level=logging.ERROR, path=str(lora_path), error=repr(e),
+            )
 
     def _load_stt_vad(self, stt_hf_repo: str, stt_pkg_dir: str, device) -> None:
         # Import search_helpers first, on its own, with a specific error
@@ -405,6 +438,7 @@ class MoshiOnlyEngine:
         # checkout is the single most likely cause of a silent "search
         # disabled" (it's a plain ModuleNotFoundError that the broad except
         # below would otherwise bury under a generic message).
+        syslog = runtime_logging.get_system_logger()
         try:
             import search_helpers
         except ImportError as e:
@@ -416,10 +450,15 @@ class MoshiOnlyEngine:
                 flush=True,
             )
             self.conv_logger.error("search_helpers_import", e, tb)
+            runtime_logging.log_event(syslog, "STT", "load_failed", level=logging.ERROR, error=repr(e))
             return
 
+        t0 = time.perf_counter()
         try:
             print(f"[liveTry] loading STT model from {stt_hf_repo}...", flush=True)
+            runtime_logging.log_event(
+                syslog, "STT", "load_start", source=stt_hf_repo, pkg_dir=stt_pkg_dir, device=str(device),
+            )
             moshi_stt = search_helpers.load_upstream_moshi_stt(stt_pkg_dir)
             stt_info = moshi_stt.models.loaders.CheckpointInfo.from_hf_repo(stt_hf_repo)
             self.stt_mimi = stt_info.get_mimi(device=device)
@@ -452,16 +491,32 @@ class MoshiOnlyEngine:
                 "stt_loaded", stt_repo=stt_hf_repo, stt_tokenizer=stt_desc,
                 main_tokenizer=main_desc, padding_token_id=self.stt_padding_token_id,
             )
+            runtime_logging.log_event(
+                syslog, "STT", "load_done", source=stt_hf_repo, device=str(device),
+                params_b=round(sum(p.numel() for p in stt_lm.parameters()) / 1e9, 2),
+                dtype="bfloat16", status="ok",
+                duration_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[liveTry] search disabled -- STT model load failed: {e!r}\n{tb}", flush=True)
             self.conv_logger.error("stt_load", e, tb)
+            runtime_logging.log_event(
+                syslog, "STT", "load_failed", level=logging.ERROR, source=stt_hf_repo, error=repr(e),
+                duration_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
             self.stt_mimi = None
             self.stt_lm_gen = None
 
     def _load_context_compressor(
         self, compressor_model: str, compressor_device: str, compressor_4bit: bool, compressor_max_passages: int
     ) -> None:
+        syslog = runtime_logging.get_system_logger()
+        t0 = time.perf_counter()
+        runtime_logging.log_event(
+            syslog, "Compressor", "load_start", source=compressor_model,
+            device=compressor_device, quantize_4bit=bool(compressor_4bit),
+        )
         try:
             import search_helpers
 
@@ -471,6 +526,11 @@ class MoshiOnlyEngine:
                 quantize_4bit=compressor_4bit,
                 max_passages=compressor_max_passages,
             )
+            runtime_logging.log_event(
+                syslog, "Compressor", "load_done", source=compressor_model,
+                device=compressor_device, quantize_4bit=bool(compressor_4bit), status="ok",
+                duration_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
         except Exception as e:
             tb = traceback.format_exc()
             print(
@@ -479,12 +539,18 @@ class MoshiOnlyEngine:
                 flush=True,
             )
             self.conv_logger.error("compressor_load", e, tb)
+            runtime_logging.log_event(
+                syslog, "Compressor", "load_failed", level=logging.ERROR,
+                source=compressor_model, error=repr(e),
+                duration_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
             self.context_compressor = None
 
     def _load_query_router(self, threshold: float, use_rules: bool) -> None:
         """Build the search/no-search router on top of the already-loaded
         compressor model. Shares weights, so this costs no extra VRAM and no
         extra load time -- only the Yes/No token-id lookup."""
+        syslog = runtime_logging.get_system_logger()
         try:
             import search_helpers
 
@@ -496,6 +562,9 @@ class MoshiOnlyEngine:
                 f"rules={'on' if use_rules else 'off'}, sharing the compressor model)",
                 flush=True,
             )
+            runtime_logging.log_event(
+                syslog, "QueryRouter", "ready", threshold=threshold, rules=bool(use_rules), status="ok",
+            )
         except Exception as e:
             tb = traceback.format_exc()
             print(
@@ -504,6 +573,9 @@ class MoshiOnlyEngine:
                 flush=True,
             )
             self.conv_logger.error("router_load", e, tb)
+            runtime_logging.log_event(
+                syslog, "QueryRouter", "load_failed", level=logging.ERROR, error=repr(e),
+            )
             self.query_router = None
 
     def _resolve_voice_prompt_path(self) -> str:
