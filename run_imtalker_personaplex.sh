@@ -82,6 +82,27 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     # the assistant's spoken answer.
     --web_search_min_score "${WEB_SEARCH_MIN_SCORE:-0.15}"
     --max_ref_tokens "${MAX_REF_TOKENS:-250}"
+    # Forensic fix (RunPod RTX 5090 run, 2026-09-05): the LLM compressor was
+    # measured taking 2.0-5.0s per call -- by far the largest latency source,
+    # and what raced (and lost to) the filler timeout above, discarding a
+    # correctly-computed answer. extractive_first tries a free, ~0ms
+    # best-sentence extraction before ever paying for that LLM forward pass.
+    --compressor_mode "${COMPRESSOR_MODE:-extractive_first}"
+    --extractive_confidence_threshold "${EXTRACTIVE_CONFIDENCE_THRESHOLD:-0.55}"
+    # Independent of the filler timeout: hard cap on how long the model is
+    # held forcibly silent waiting on a slow search/compress. The search
+    # keeps running past this point; only the forced silence is released.
+    --max_suppress_sec "${MAX_SUPPRESS_SEC:-3.0}"
+    # Spread a 20-30 token <ref> injection across several 80ms ticks instead
+    # of blocking the real-time GPU thread for up to ~1.3s in one call
+    # (measured in the same run) -- keeps mic ingestion and avatar rendering
+    # close to their normal cadence during injection.
+    --inject_tokens_per_tick "${INJECT_TOKENS_PER_TICK:-4}"
+    # If no real text/audio follows an injection within this many seconds,
+    # log it immediately instead of waiting for the next question's VAD to
+    # notice minutes later (observed: turn 7 in the same run went silent for
+    # 50+ seconds after a clean, on-time injection).
+    --post_inject_watchdog_sec "${POST_INJECT_WATCHDOG_SEC:-4.0}"
   )
   # Web search is what "needs live data" resolves to, so default it ON
   # whenever a key is available. Without a key the router still runs and
@@ -134,7 +155,7 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
   [[ -e "$IM/search_helpers.py" ]] || { echo "Missing required search path: $IM/search_helpers.py" >&2; exit 1; }
 fi
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="34f796b7fb6df670806645900e91b514fd1808688a8608965ca6a192fa822df3"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="707e98be6dc4153bb16b065856ddb010fa084693b038f551aa87a85509bc720c"
  ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"

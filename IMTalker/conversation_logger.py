@@ -297,11 +297,11 @@ class ConversationLogger:
             elapsed_s=round(float(elapsed_s), 3),
         )
 
-    def turn_ground(self, turn_id: Any, text: str, used_fallback: bool) -> None:
-        how = "extractive" if used_fallback else "compressed"
+    def turn_ground(self, turn_id: Any, text: str, used_fallback: bool, source: str = "") -> None:
+        how = source or ("extractive" if used_fallback else "compressed")
         body = f'({how}) "{text}"' if text else f"({how}) nothing usable produced"
         self._turn(turn_id, "GROUND", body, "turn_ground",
-                   grounding=text, used_fallback=bool(used_fallback))
+                   grounding=text, used_fallback=bool(used_fallback), source=source)
 
     def turn_done(self, turn_id: Any, outcome: str, total_s: float) -> None:
         """Closes the turn's decision phase. `outcome` is a short phrase such

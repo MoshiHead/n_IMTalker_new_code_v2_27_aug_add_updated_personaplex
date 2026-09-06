@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import queue
+import re
 
 import ws_av_binary_codec as _wsbin
 import sys
@@ -208,18 +209,66 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         capture_layer: int = -2,
         thinking_sound_path: str = "",
         search_max_filler_sec: float = 6.0,
+        compressor_mode: str = "extractive_first",
+        extractive_confidence_threshold: float = 0.55,
+        max_suppress_sec: float = 3.0,
+        inject_tokens_per_tick: int = 4,
+        post_inject_watchdog_sec: float = 4.0,
         **kwargs,
     ) -> None:
         self.tf_capture_layer = int(capture_layer)
         super().__init__(*args, **kwargs)
 
-        # Forensic finding (see search_helpers.py / conversation_logger.py):
-        # real search+compression latency runs ~2.5-3.7s end to end, so the
-        # filler cap must be comfortably above that or a correctly-computed
-        # answer gets discarded every time. Overrides the class-level default
-        # below with an instance attribute computed from a CLI-configurable
-        # seconds value.
+        # Forensic finding (RunPod RTX 5090 run, logs_1/conversation.log,
+        # 2026-09-05): real search+compression latency was 3.4-6.6s end to
+        # end, dominated by the LLM compressor (2.0-5.0s for 14-35 tokens --
+        # 10-30x slower than a 1.5B model should take in isolation, most
+        # likely GPU contention with the continuously-running avatar
+        # pipeline). The filler cap must stay comfortably above whatever the
+        # (now-optional) LLM compression path can take, so the fallback never
+        # races and discards a correctly-computed answer the way it did in
+        # that log's turn 4.
         self._SEARCH_MAX_FILLER_FRAMES = max(1, round(float(search_max_filler_sec) * TARGET_SR / MIMI_FRAME_SIZE))
+
+        # -- Compression strategy: "extractive_first" (default) tries a free,
+        # ~0ms, CPU-only best-sentence extraction (search_helpers.
+        # extract_best_sentence) before ever paying for an LLM forward pass;
+        # the LLM compressor only runs when extraction is not confident. This
+        # is what cuts the 2-5s compression latency out of the common case.
+        # "llm_only" reproduces the old (pre-fix) behavior; "extractive_only"
+        # never calls the LLM at all. See _route_and_search.
+        self.compressor_mode = str(compressor_mode or "extractive_first")
+        self.extractive_confidence_threshold = float(extractive_confidence_threshold)
+
+        # Forensic finding: turn 4's 6.6s of forced silence (suppress_text_
+        # until_ref) preceded a stuck-silence failure; independent of THAT
+        # bug's exact cause, holding the model artificially silent for many
+        # seconds is itself undesirable. This caps how long a turn may be
+        # held silent waiting on a slow search/compress, regardless of
+        # whether the <ref> is ready yet -- when it expires, suppression is
+        # lifted early (the model may say something generic) but the
+        # in-flight search keeps running and its <ref> still gets injected
+        # normally once ready.
+        self.max_suppress_sec = float(max_suppress_sec)
+
+        # Injecting N tokens synchronously in one _step() call was measured
+        # blocking the real-time GPU thread for up to 1.3s at once (logs_1,
+        # turn 7's ref_inject stage) -- during which no mic audio is consumed
+        # and no avatar frame is produced. Spreading injection across
+        # multiple 80ms ticks (a few tokens per tick) keeps each _step() call
+        # close to its normal budget.
+        self.inject_tokens_per_tick = max(1, int(inject_tokens_per_tick))
+
+        # Forensic finding: turn 7 was a CLEAN, on-time <ref> injection (no
+        # timeout, no fallback) that was still followed by 50+ seconds of
+        # pure silence -- proving the stuck-silence failure is not only the
+        # timeout race. Rather than wait for the next question's VAD to
+        # notice (10-50s later, per logs_1), watch for real speech resuming
+        # within this many seconds of injection and log a loud, immediate
+        # warning (and close the turn out) if it does not. This does not by
+        # itself fix the underlying model behavior; it makes it fast to
+        # detect and measure so the fix can be verified on real hardware.
+        self.post_inject_watchdog_sec = float(post_inject_watchdog_sec)
 
         # "Thinking sound": played in place of the model's own audio ONLY while
         # an online search is actually running (see _start_thinking_sound and
@@ -560,6 +609,26 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self._thinking_sound_cursor = 0
         self._thinking_sound_started_at = 0.0
         self._thinking_sound_play_count = 0
+        # When suppression (forced silence) started, for the max_suppress_sec
+        # cap in _consume_pending. None means "not currently suppressing".
+        self._suppress_started_perf: float | None = None
+        # Tokens still waiting to be fed in _inject_tokens, drained a few per
+        # tick (inject_tokens_per_tick) instead of all at once, so injection
+        # never blocks the real-time GPU thread for more than a fraction of a
+        # tick's budget. (kind, remaining_tokens) or None when idle.
+        self._injection_in_progress: tuple[str, list[int]] | None = None
+        self._injection_started_perf: float = 0.0
+        self._injection_total_tokens: int = 0
+        self._injection_token_text: str = ""
+        # Post-injection stuck-silence watchdog: set to the perf_counter
+        # reading when a <ref>/fallback injection completes, cleared the
+        # moment real speech (non-padding token) is observed again. If it
+        # stays set past post_inject_watchdog_sec, _consume_pending logs a
+        # loud warning and closes the turn out immediately instead of
+        # waiting for the next question's VAD to notice.
+        self._post_inject_watch_started: float | None = None
+        self._post_inject_watch_turn: int | None = None
+        self._post_inject_watch_fired = False
 
     def _next_thinking_sound_chunk(self) -> np.ndarray:
         """Next MIMI_FRAME_SIZE samples of the thinking sound, looping
@@ -600,6 +669,8 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         it commits to searching, while the model-router path signals from the
         background thread, and both can land for the same turn."""
         if self.suppress_text_during_search:
+            if not self.suppress_text_until_ref:
+                self._suppress_started_perf = time.perf_counter()
             self.suppress_text_until_ref = True
         # Recorded regardless of thinking_sound_pcm below: this flag answers
         # "did this turn wait on a search" for the conversation log, which is
@@ -637,16 +708,43 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         )
 
     def _inject_tokens(self, tokens: list[int]) -> None:
-        """Force-feed text tokens via the PUBLIC lm_gen.step() (not the
-        hidden-capturing `_step` installed above). reset_streaming() is never
-        called: the shared KV-cache (and the conversation heard so far) stays
-        intact across the injection."""
+        """Force-feed text tokens into the live stream. reset_streaming() is
+        never called: the shared KV-cache (and the conversation heard so far)
+        stays intact across the injection.
+
+        Calls `self.lm_gen._step(...)` -- the SAME patched, hidden-capturing
+        method every other 80ms tick in _step() uses -- rather than the public
+        `self.lm_gen.step(...)` wrapper. Both used to resolve to the same
+        underlying call (Python attribute lookup finds the instance-level
+        monkey-patch installed by _install_graph_hidden_capture() either way),
+        but `.step()`'s own bookkeeping was written for a `_step()` that
+        returns the library's stock shape, not our 3-tuple
+        (output, transformer_out, transformer_out). Calling `._step()`
+        directly removes that mismatch and keeps injection on the exact same
+        code path as normal generation, which is the most likely source of
+        the intermittent "model goes silent after an injection and never
+        recovers" failures seen in logs_1/conversation.log (turn 7: a clean,
+        on-time <ref> injection followed by 50+ seconds of pure silence).
+
+        Only safe when the installed `_step` actually accepts these kwargs
+        (the PersonaPlex graphed-hidden path -- see
+        _install_graph_hidden_capture / _step_supports_text_token). The
+        fallback (non-PersonaPlex) graphed-layer path's `_step` takes a
+        positional `input_tokens` tensor only, so injection there still goes
+        through the public `.step()` wrapper, exactly as before."""
         for tok in tokens:
-            self.lm_gen.step(
-                moshi_tokens=self.lm_gen._encode_zero_frame(),
-                text_token=tok,
-                input_tokens=self.lm_gen._encode_sine_frame(),
-            )
+            if self._step_supports_text_token:
+                self.lm_gen._step(
+                    moshi_tokens=self.lm_gen._encode_zero_frame(),
+                    text_token=tok,
+                    input_tokens=self.lm_gen._encode_sine_frame(),
+                )
+            else:
+                self.lm_gen.step(
+                    moshi_tokens=self.lm_gen._encode_zero_frame(),
+                    text_token=tok,
+                    input_tokens=self.lm_gen._encode_sine_frame(),
+                )
 
     def _stt_step(self, chunk: torch.Tensor) -> None:
         """Run the separate STT/VAD submodel one 80ms frame forward (same GPU
@@ -683,6 +781,25 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         )
         self.stt_last_vad_end = self.stt_silence_frame_count >= self._VAD_SILENCE_FRAMES_REQUIRED
         if vad_fired and self.stt_in_utterance and self.stt_token_buffer and not self.search_awaiting_ref:
+            # Since injection is now spread across several ticks
+            # (search_awaiting_ref goes False the instant it STARTS, not when
+            # it finishes -- see _consume_pending), a new utterance's VAD can
+            # fire while a few <ref>/fallback tokens from the PREVIOUS turn
+            # are still queued. Flush them synchronously right here rather
+            # than either (a) blocking vad_fired -- which would leave that
+            # utterance's tokens sitting unflushed in stt_token_buffer,
+            # merging it with whatever the user says next once the block
+            # lifts -- or (b) letting _start_turn() proceed while the old
+            # injection is still trickling in, interleaving the previous
+            # turn's forced tokens with the new turn's own generation. What
+            # is left at this point is only the last few tokens of that
+            # block (most of it already fed on prior ticks), so this is a
+            # short, bounded flush, not a return of the original ~1.3s stall.
+            if self._injection_in_progress is not None:
+                kind, remaining = self._injection_in_progress
+                self._injection_in_progress = None
+                self._inject_tokens(remaining)
+                self._finish_ref_injection(kind, time.perf_counter() - self._injection_started_perf)
             import search_helpers
 
             t_speech_end = time.perf_counter()
@@ -1046,12 +1163,90 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             if my_epoch != self.search_turn_epoch or self.search_ref_committed_this_turn:
                 return
 
+            # -- Compression: extractive-first, LLM only when extraction is
+            # not confident enough. -----------------------------------------
+            #
+            # Forensic finding (logs_1/conversation.log, 2026-09-05 RunPod
+            # run): the LLM compressor (Qwen2.5-1.5B, 4-bit) took 2.0-5.0s for
+            # a 14-35 token reply on an RTX 5090 -- 10-30x slower than a small
+            # model doing greedy decode should take in isolation. It shares
+            # the GPU with the continuously-running PersonaPlex/IMTalker
+            # avatar pipeline (25fps rendering + audio generation on the same
+            # physical device from a different thread), which is the far more
+            # likely explanation than the model itself being slow. That 2-5s
+            # is by far the largest component of every search turn's latency,
+            # AND it is what was racing (and losing to) the 6.0s filler
+            # timeout in turn 4, discarding a correctly-computed answer.
+            #
+            # Most of these queries (price/score/rate lookups) are answered
+            # by a single, mostly-clean sentence already present in the web
+            # result -- exactly what extract_best_sentence() (pure Python,
+            # ~0ms, no GPU) picks out. Try that FIRST; only pay for the LLM
+            # forward pass when extraction is not confident (no digit in the
+            # picked sentence, or a weak keyword-overlap score).
             grounding = ""
             used_fallback = False
+            grounding_source = ""
             t_compress0 = time.perf_counter()
-            if hits and self.context_compressor is not None:
+
+            extractive_text = ""
+            extractive_score = 0.0
+            if hits and self.compressor_mode in ("extractive_first", "extractive_only"):
+                extractive_text, extractive_score = search_helpers.extract_best_sentence(transcript, hits)
+                has_digit = bool(re.search(r"\d", extractive_text))
+                # Almost every search-triggering question here asks for a
+                # quantifiable value (price/rate/score/"how much") -- the
+                # router's own live-topic rules are built around that. A
+                # smoke test caught a real failure mode of an earlier, looser
+                # version of this gate: a short, topically-related sentence
+                # that did NOT contain the actual figure (e.g. "the gold
+                # market can go through periods of quiet trading" for a gold
+                # PRICE question) scored high enough on overlap alone to pass
+                # as confident. Requiring a digit at the normal threshold, or
+                # a much higher bar without one (name/event answers, e.g.
+                # "who is the current president of France"), avoids that.
+                confident = bool(
+                    extractive_text
+                    and (
+                        (has_digit and extractive_score >= self.extractive_confidence_threshold)
+                        or (not has_digit and extractive_score >= max(2 * self.extractive_confidence_threshold, 0.9))
+                    )
+                )
+                if confident:
+                    grounding = extractive_text
+                    grounding_source = "extractive"
+                    extractive_elapsed = time.perf_counter() - t_compress0
+                    self._turn_timing_stages["compression"] = (
+                        self._turn_timing_stages.get("compression", 0.0) + extractive_elapsed
+                    )
+                    self.conv_logger.compressor_call(
+                        transcript, [h.get("text", "") for h in hits[:2]], grounding,
+                        extractive_elapsed, used_fallback=False,
+                    )
+                    self.conv_logger.latency.stage(
+                        my_epoch, "compression_extractive", extractive_elapsed,
+                        note=f"score={extractive_score:.2f} has_digit={has_digit} (LLM call skipped)",
+                    )
+                    self.conv_logger.latency.count(
+                        my_epoch, grounding_source="extractive",
+                        extractive_score=round(extractive_score, 3), extractive_has_digit=has_digit,
+                    )
+                    self.conv_logger.narrate_summary(my_epoch, "a web search", len(hits), grounding, used_fallback=False)
+                else:
+                    runtime_logging.log_event(
+                        runtime_logging.get_system_logger(), "Compressor", "extractive_not_confident",
+                        score=round(extractive_score, 3), has_digit=has_digit,
+                        text_preview=extractive_text[:80],
+                    )
+
+            if (
+                not grounding and hits and self.context_compressor is not None
+                and self.compressor_mode != "extractive_only"
+            ):
+                t_llm0 = time.perf_counter()
                 grounding = self.context_compressor.compress(question=transcript, chunks=hits)
-                primary_elapsed = time.perf_counter() - t_compress0
+                grounding_source = "llm" if grounding else grounding_source
+                primary_elapsed = time.perf_counter() - t_llm0
                 self._turn_timing_stages["compression"] = (
                     self._turn_timing_stages.get("compression", 0.0) + primary_elapsed
                 )
@@ -1061,7 +1256,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 )
                 comp_stats = dict(getattr(self.context_compressor, "last_stats", {}) or {})
                 self.conv_logger.latency.stage(
-                    my_epoch, "compression", primary_elapsed,
+                    my_epoch, "compression_llm", primary_elapsed,
                     note=(
                         f"{comp_stats.get('compressor_output_tokens', 0)} token(s) out"
                         + (" [REJECTED]" if comp_stats.get("compressor_rejected") else "")
@@ -1071,8 +1266,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     self.conv_logger.latency.count(my_epoch, **comp_stats)
                 if grounding:
                     self.conv_logger.narrate_summary(my_epoch, "a web search", len(hits), grounding, used_fallback=False)
+
             if not grounding and hits:
                 used_fallback = True
+                grounding_source = grounding_source or "multi_sentence_fallback"
                 t_fallback0 = time.perf_counter()
                 grounding = search_helpers.summarize_web_fallback(
                     transcript, hits, max_sentences=2, max_chars=200
@@ -1091,13 +1288,17 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 )
                 if grounding:
                     self.conv_logger.narrate_summary(my_epoch, "a web search", len(hits), grounding, used_fallback=True)
+            self.conv_logger.latency.count(my_epoch, grounding_source=grounding_source or "none")
             if not grounding:
                 self.conv_logger.narrate_no_information(my_epoch)
-            self.conv_logger.turn_ground(my_epoch, grounding, used_fallback=used_fallback)
+            self.conv_logger.turn_ground(my_epoch, grounding, used_fallback=used_fallback, source=grounding_source)
             self.conv_logger.latency.mark(
                 my_epoch, "grounding_ready",
-                ("extractive fallback" if used_fallback else "compressed by the LLM")
-                if grounding else "nothing usable was produced",
+                {
+                    "extractive": "extracted directly from search results (no LLM call)",
+                    "llm": "compressed by the LLM",
+                    "multi_sentence_fallback": "extractive fallback (LLM produced nothing usable)",
+                }.get(grounding_source, "nothing usable was produced"),
             )
 
             if my_epoch != self.search_turn_epoch or self.search_ref_committed_this_turn:
@@ -1211,27 +1412,134 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         except Exception:
             pass
 
+    def _finish_ref_injection(self, kind: str, elapsed: float) -> None:
+        """Common bookkeeping once a <ref>/fallback injection's tokens have
+        all been fed (whether that happened in one _consume_pending() call or
+        was spread across several -- see _injection_in_progress).
+
+        Releases suppress_text_until_ref HERE, at the end, not when injection
+        starts: while _injection_in_progress is being drained across several
+        ticks, _step()'s own per-tick call to self.lm_gen._step(codes...)
+        still runs once per tick after _consume_pending() returns. If
+        suppression were already released, that per-tick call would sample
+        the model's OWN (real, unsuppressed) text -- interleaving it with the
+        still-in-flight forced <ref> tokens instead of letting the model
+        continue cleanly from the completed injection."""
+        self.suppress_text_until_ref = False
+        self._suppress_started_perf = None
+        n_tokens = self._injection_total_tokens
+        token_text = self._injection_token_text
+        self._turn_timing_stages["ref_inject"] = elapsed
+        self.conv_logger.latency.stage(
+            self._latency_turn_id, "ref_inject", elapsed,
+            note=f"{n_tokens} token(s) fed into the live context ({kind})",
+        )
+        if kind == "ref":
+            self.conv_logger.latency.mark(
+                self._latency_turn_id, "ref_injected",
+                f"after {self.search_filler_frame_count} filler chunk(s)",
+            )
+            self.conv_logger.ref_injected(token_text, n_tokens, elapsed, kind="ref")
+            n_before, max_tok = self._pending_ref_token_counts
+            self.conv_logger.narrate_injection(
+                self.search_turn_epoch, token_text, n_tokens, n_before, max_tok, kind="ref",
+            )
+            self.conv_logger.turn_done(
+                self.search_turn_epoch, "grounded from web search",
+                time.perf_counter() - (self._turn_timing_start or time.perf_counter()),
+            )
+            print(
+                f"[liveTryPlasticity][search] <ref> injected ({n_tokens} tok) "
+                f"after {self.search_filler_frame_count} filler chunks",
+                flush=True,
+            )
+        else:  # fallback (filler timeout)
+            self.conv_logger.latency.mark(
+                self._latency_turn_id, "ref_injected",
+                f"filler timeout after {self.search_filler_frame_count} chunk(s) -- "
+                f"the search did not finish in time",
+            )
+            self.conv_logger.latency.count(
+                self._latency_turn_id, search_timed_out=True, grounding_tokens_injected=n_tokens,
+            )
+            self.conv_logger.ref_injected(token_text, n_tokens, elapsed, kind="ref_fallback")
+            self.conv_logger.narrate_injection(
+                self.search_turn_epoch, token_text, n_tokens, n_tokens, self.max_ref_tokens, kind="ref_fallback",
+            )
+            self.conv_logger.turn_done(
+                self.search_turn_epoch, "search timed out, answered from own knowledge",
+                time.perf_counter() - (self._turn_timing_start or time.perf_counter()),
+            )
+            print("[liveTryPlasticity][search] <ref> fallback injected after filler timeout", flush=True)
+        self._log_timing_summary()
+        # Start the stuck-silence watchdog: real speech should resume within
+        # post_inject_watchdog_sec. See _step()'s post-injection check.
+        self._post_inject_watch_started = time.perf_counter()
+        self._post_inject_watch_turn = self.search_turn_epoch
+        self._post_inject_watch_fired = False
+
     def _consume_pending(self) -> None:
         """Called once per chunk while a routing/search decision is in flight.
         This is the ONLY place the background thread's work reaches the LM,
         because token injection must happen on the GPU thread.
 
-        Three outcomes, checked in priority order:
+        Checked in priority order:
+          0. an injection already in progress -- drain up to
+             inject_tokens_per_tick more tokens of it and return. Spreading a
+             20-30 token <ref> injection across several ticks (instead of
+             blocking one _step() call for up to ~1.3s, as measured in
+             logs_1/conversation.log turn 7) keeps mic ingestion and avatar
+             rendering close to their normal cadence during it.
           1. cancelled  -- the router decided no search is needed; stop the
                            thinking sound and let the model answer normally.
-          2. ref ready  -- inject the grounded <ref> block.
-          3. timed out  -- after self._SEARCH_MAX_FILLER_FRAMES chunks inject a
-                           generic fallback so the model never hangs waiting on
-                           a slow or failed search."""
+          2. ref ready  -- start injecting the grounded <ref> block.
+          3. timed out  -- after self._SEARCH_MAX_FILLER_FRAMES chunks start
+                           injecting a generic fallback so the model never
+                           hangs waiting on a slow or failed search.
+        Independently of all of the above: if suppression has lasted longer
+        than max_suppress_sec, release it early so the model is not held
+        artificially silent indefinitely -- the in-flight search keeps
+        running and its <ref> (or the timeout fallback) still gets injected
+        normally once ready."""
         import search_helpers
 
         self.search_filler_frame_count += 1
+
+        if self._injection_in_progress is not None:
+            kind, remaining = self._injection_in_progress
+            batch = remaining[: self.inject_tokens_per_tick]
+            self._inject_tokens(batch)
+            remaining = remaining[self.inject_tokens_per_tick:]
+            if remaining:
+                self._injection_in_progress = (kind, remaining)
+                return
+            self._injection_in_progress = None
+            elapsed = time.perf_counter() - self._injection_started_perf
+            self._finish_ref_injection(kind, elapsed)
+            return
+
+        if (
+            self.suppress_text_until_ref
+            and self._suppress_started_perf is not None
+            and (time.perf_counter() - self._suppress_started_perf) > self.max_suppress_sec
+        ):
+            self.suppress_text_until_ref = False
+            self.conv_logger.event(
+                "suppress_cap_released", turn=self.search_turn_epoch,
+                waited_s=round(time.perf_counter() - self._suppress_started_perf, 2),
+            )
+            print(
+                f"[liveTryPlasticity][search] max_suppress_sec ({self.max_suppress_sec:.1f}s) reached -- "
+                f"releasing forced silence early; the search keeps running in the background",
+                flush=True,
+            )
 
         if self.pending_search_cancelled:
             self.pending_search_cancelled = False
             self.pending_lookup_tokens = None
             self.pending_start_thinking = False
             self.suppress_text_until_ref = False
+            self._suppress_started_perf = None
             self.search_awaiting_ref = False
             self.search_ref_committed_this_turn = True
             self._stop_thinking_sound(
@@ -1279,74 +1587,45 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self.pending_ref_tokens = None
             self.search_awaiting_ref = False
             self.search_ref_committed_this_turn = True
-            self.suppress_text_until_ref = False
+            # Force ON (not merely leave as-is): max_suppress_sec may have
+            # already released it while we were still waiting for this ref to
+            # arrive. It must be True for the full (possibly multi-tick)
+            # duration of the injection -- released in _finish_ref_injection,
+            # not here. See that method's docstring for why.
+            self.suppress_text_until_ref = True
             self._stop_thinking_sound(self.search_turn_epoch, "ref_ready", "the answer was ready")
-            t0 = time.perf_counter()
-            self._inject_tokens(ref_tokens)
-            elapsed = time.perf_counter() - t0
-            self._turn_timing_stages["ref_inject"] = elapsed
-            self.conv_logger.latency.stage(
-                self._latency_turn_id, "ref_inject", elapsed,
-                note=f"{len(ref_tokens)} token(s) fed into the live context",
-            )
-            self.conv_logger.latency.mark(
-                self._latency_turn_id, "ref_injected",
-                f"after {self.search_filler_frame_count} filler chunk(s)",
-            )
-            self.conv_logger.ref_injected(self.tokenizer.decode(ref_tokens), len(ref_tokens), elapsed, kind="ref")
-            n_before, max_tok = self._pending_ref_token_counts
-            self.conv_logger.narrate_injection(
-                self.search_turn_epoch, self.tokenizer.decode(ref_tokens), len(ref_tokens),
-                n_before, max_tok, kind="ref",
-            )
-            self.conv_logger.turn_done(
-                self.search_turn_epoch, "grounded from web search",
-                time.perf_counter() - (self._turn_timing_start or time.perf_counter()),
-            )
-            self._log_timing_summary()
-            print(
-                f"[liveTryPlasticity][search] <ref> injected ({len(ref_tokens)} tok) "
-                f"after {self.search_filler_frame_count} filler chunks",
-                flush=True,
-            )
+            self._injection_started_perf = time.perf_counter()
+            self._injection_total_tokens = len(ref_tokens)
+            self._injection_token_text = self.tokenizer.decode(ref_tokens)
+            first_batch = ref_tokens[: self.inject_tokens_per_tick]
+            self._inject_tokens(first_batch)
+            rest = ref_tokens[self.inject_tokens_per_tick:]
+            if rest:
+                self._injection_in_progress = ("ref", rest)
+            else:
+                self._finish_ref_injection("ref", time.perf_counter() - self._injection_started_perf)
         elif self.search_filler_frame_count >= self._SEARCH_MAX_FILLER_FRAMES:
             fallback_text = "There's no specific information available on this, so answer from general knowledge."
             fallback = self.tokenizer.encode(search_helpers.wrap_with_ref_tags(fallback_text))
             self.search_awaiting_ref = False
             self.search_ref_committed_this_turn = True
-            self.suppress_text_until_ref = False
+            # Force ON for the same reason as the ref-ready branch above --
+            # released in _finish_ref_injection, not here.
+            self.suppress_text_until_ref = True
             self._stop_thinking_sound(
                 self.search_turn_epoch, "filler_timeout",
                 "the search was taking too long, so the assistant moved on with what it had",
             )
-            t0 = time.perf_counter()
-            self._inject_tokens(fallback)
-            fallback_inject_elapsed = time.perf_counter() - t0
-            self._turn_timing_stages["ref_inject"] = fallback_inject_elapsed
-            self.conv_logger.latency.stage(
-                self._latency_turn_id, "ref_inject", fallback_inject_elapsed,
-                note=f"{len(fallback)} token(s), generic fallback after filler timeout",
-            )
-            self.conv_logger.latency.mark(
-                self._latency_turn_id, "ref_injected",
-                f"filler timeout after {self.search_filler_frame_count} chunk(s) -- "
-                f"the search did not finish in time",
-            )
-            self.conv_logger.latency.count(
-                self._latency_turn_id, search_timed_out=True,
-                grounding_tokens_injected=len(fallback),
-            )
-            self.conv_logger.ref_injected(fallback_text, len(fallback), fallback_inject_elapsed, kind="ref_fallback")
-            self.conv_logger.narrate_injection(
-                self.search_turn_epoch, fallback_text, len(fallback), len(fallback),
-                self.max_ref_tokens, kind="ref_fallback",
-            )
-            self.conv_logger.turn_done(
-                self.search_turn_epoch, "search timed out, answered from own knowledge",
-                time.perf_counter() - (self._turn_timing_start or time.perf_counter()),
-            )
-            self._log_timing_summary()
-            print("[liveTryPlasticity][search] <ref> fallback injected after filler timeout", flush=True)
+            self._injection_started_perf = time.perf_counter()
+            self._injection_total_tokens = len(fallback)
+            self._injection_token_text = fallback_text
+            first_batch = fallback[: self.inject_tokens_per_tick]
+            self._inject_tokens(first_batch)
+            rest = fallback[self.inject_tokens_per_tick:]
+            if rest:
+                self._injection_in_progress = ("fallback", rest)
+            else:
+                self._finish_ref_injection("fallback", time.perf_counter() - self._injection_started_perf)
 
     @torch.no_grad()
     def _step(self, pcm24: np.ndarray) -> dict:
@@ -1384,9 +1663,18 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.conv_logger.error("stt_step", e, tb)
                 self.search_hard_disabled = True
                 self.search_awaiting_ref = False
+                self._injection_in_progress = None
                 self.search_thinking_active = False
                 self.suppress_text_until_ref = False
-        if self.search_awaiting_ref and not self.search_hard_disabled:
+        # Also keep polling while a ref/fallback injection is being drained
+        # across multiple ticks (self._injection_in_progress) -- that flag
+        # stays set for a few ticks AFTER search_awaiting_ref has already
+        # gone False (it is cleared the instant injection starts, not when it
+        # finishes), so consume_pending must still be called until it empties.
+        if (
+            (self.search_awaiting_ref or self._injection_in_progress is not None)
+            and not self.search_hard_disabled
+        ):
             try:
                 self._consume_pending()
             except Exception as e:
@@ -1399,6 +1687,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.conv_logger.error("consume_pending", e, tb)
                 self.search_hard_disabled = True
                 self.search_awaiting_ref = False
+                self._injection_in_progress = None
                 self.search_thinking_active = False
                 self.suppress_text_until_ref = False
 
@@ -1455,6 +1744,45 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # replace it below: after the swap, `reply_pcm` may be the filler clip,
         # whose level says nothing about whether the model is speaking.
         model_own_rms = float(np.sqrt(np.mean(np.square(reply_pcm, dtype=np.float32))))
+
+        # -- Post-injection stuck-silence watchdog ---------------------------
+        # Forensic finding (logs_1/conversation.log, RunPod RTX 5090,
+        # 2026-09-05, turn 7): a clean, on-time <ref> injection -- no timeout,
+        # no fallback -- was followed by 50+ seconds of the model producing
+        # ONLY padding/silence text tokens, discovered only because the NEXT
+        # question's VAD eventually fired. That is far too slow to notice or
+        # diagnose. This does not attempt to fix the model's behavior (there
+        # is no evidence-backed intervention available from this side of the
+        # API); it detects the same condition within post_inject_watchdog_sec
+        # and closes the turn's latency record out immediately, so "answer
+        # complete" is never confused with "audio was actually delivered".
+        if self._post_inject_watch_started is not None:
+            if token_piece or model_own_rms > self._SPEECH_RMS_THRESHOLD:
+                self._post_inject_watch_started = None
+                self._post_inject_watch_fired = False
+            elif (
+                not self._post_inject_watch_fired
+                and (time.perf_counter() - self._post_inject_watch_started) > self.post_inject_watchdog_sec
+            ):
+                self._post_inject_watch_fired = True
+                stuck_elapsed = time.perf_counter() - self._post_inject_watch_started
+                watch_turn = self._post_inject_watch_turn
+                runtime_logging.log_event(
+                    runtime_logging.get_system_logger(), "PersonaPlex", "post_injection_silence",
+                    level=logging.ERROR, turn=watch_turn, elapsed_s=round(stuck_elapsed, 2),
+                )
+                self.conv_logger.event(
+                    "post_injection_silence_watchdog",
+                    f"turn={watch_turn} produced no text/audio {stuck_elapsed:.1f}s after the "
+                    f"answer was injected -- treating audio delivery as failed for this turn",
+                    turn=watch_turn, elapsed_s=round(stuck_elapsed, 2),
+                )
+                self.conv_logger.latency.count(
+                    self._latency_turn_id, audio_delivery_status="stuck_no_audio_after_injection",
+                )
+                self._finish_turn_latency(
+                    "", outcome=f"stuck silence: no audio {stuck_elapsed:.1f}s after injection",
+                )
 
         # First real audio of this turn -> the honest end-to-end latency.
         was_awaiting_first_speech = self._turn_awaiting_first_speech
@@ -3123,6 +3451,40 @@ class LiveHeliumFMOptions(BaseOptions):
             "--search_max_filler_sec", type=float, default=6.0,
             help="Cap on how long the model is held waiting for search+compression before a generic fallback <ref> is injected.",
         )
+        parser.add_argument(
+            "--compressor_mode", default="extractive_first",
+            choices=["extractive_first", "llm_only", "extractive_only"],
+            help="How web-search results become the injected <ref> text. 'extractive_first' (default) "
+                 "tries a free, ~0ms best-sentence extraction first and only calls the LLM compressor "
+                 "when that is not confident -- this is what removes the 2-5s LLM compression latency "
+                 "from the common case. 'llm_only' reproduces the old always-call-the-LLM behavior. "
+                 "'extractive_only' never calls the LLM (fastest, lowest VRAM, slightly less polished text).",
+        )
+        parser.add_argument(
+            "--extractive_confidence_threshold", type=float, default=0.55,
+            help="Minimum keyword-overlap score for the extractive compressor to be used without "
+                 "falling back to the LLM (only relevant with --compressor_mode extractive_first).",
+        )
+        parser.add_argument(
+            "--max_suppress_sec", type=float, default=3.0,
+            help="Hard cap on how long the model is held forcibly silent (suppress_text_during_search) "
+                 "waiting on a slow search/compress, independent of --search_max_filler_sec. When it "
+                 "expires, forced silence is released early but the search keeps running and its <ref> "
+                 "still gets injected normally once ready.",
+        )
+        parser.add_argument(
+            "--inject_tokens_per_tick", type=int, default=4,
+            help="Max <ref>/fallback tokens force-fed into the live context per 80ms _step() tick. "
+                 "Spreads a 20-30 token injection across several ticks instead of blocking the "
+                 "real-time GPU thread (mic ingestion + avatar rendering) for up to ~1.3s at once.",
+        )
+        parser.add_argument(
+            "--post_inject_watchdog_sec", type=float, default=4.0,
+            help="If no real text/audio is produced within this many seconds of a <ref>/fallback "
+                 "injection completing, log it immediately (system_runtime.log + conversation.log) "
+                 "and close the turn's latency record out, instead of waiting for the next question's "
+                 "VAD to notice minutes later.",
+        )
         return parser
 
 
@@ -3209,6 +3571,11 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 conversation_log_dir=getattr(args, "conversation_log_dir", ""),
                 thinking_sound_path=getattr(args, "thinking_sound_path", ""),
                 search_max_filler_sec=float(getattr(args, "search_max_filler_sec", 6.0)),
+                compressor_mode=getattr(args, "compressor_mode", "extractive_first"),
+                extractive_confidence_threshold=float(getattr(args, "extractive_confidence_threshold", 0.55)),
+                max_suppress_sec=float(getattr(args, "max_suppress_sec", 3.0)),
+                inject_tokens_per_tick=int(getattr(args, "inject_tokens_per_tick", 4)),
+                post_inject_watchdog_sec=float(getattr(args, "post_inject_watchdog_sec", 4.0)),
             )
         return moshi_engine
 

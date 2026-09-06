@@ -1002,6 +1002,42 @@ def _content_words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9$£€%.,]+", text.lower()) if len(w) > 2 and w not in _STOPWORDS}
 
 
+def extract_best_sentence(transcript: str, hits: list[dict], max_chars: int = 200) -> tuple[str, float]:
+    """Single best-scoring extractive sentence, plus its confidence score, so
+    a caller can decide whether extraction alone is good enough to skip an
+    LLM compression pass entirely (that pass is what was costing 2-5s per
+    search turn -- see ContextCompressor -- almost all of it GPU contention
+    with the concurrently-running PersonaPlex/avatar pipeline, not the 1.5B
+    model itself being slow in isolation).
+
+    Same scoring as summarize_web_fallback (content-word overlap normalized
+    by sentence length), refactored to expose the top score instead of only
+    the joined top-N text. Returns ("", 0.0) if no usable sentence exists."""
+    full_text = " ".join(c.get("text", "") for c in hits)
+    sentences = re.split(r"(?<=[.!?])\s+", full_text.strip())
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
+    terminated = [s for s in sentences if s.endswith((".", "!", "?"))]
+    if terminated:
+        sentences = terminated
+    if not sentences:
+        return "", 0.0
+
+    query_words = _content_words(transcript)
+    scored = []
+    for idx, sent in enumerate(sentences):
+        sent_words = _content_words(sent)
+        if not sent_words:
+            continue
+        overlap = len(query_words & sent_words)
+        scored.append((overlap / (len(sent_words) ** 0.5), idx))
+    if not scored:
+        return "", 0.0
+
+    scored.sort(reverse=True)
+    best_score, best_idx = scored[0]
+    return sentences[best_idx][:max_chars], float(best_score)
+
+
 def summarize_web_fallback(
     transcript: str, hits: list[dict], max_sentences: int = 2, max_chars: int = 200,
 ) -> str:
