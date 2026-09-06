@@ -103,6 +103,16 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     # notice minutes later (observed: turn 7 in the same run went silent for
     # 50+ seconds after a clean, on-time injection).
     --post_inject_watchdog_sec "${POST_INJECT_WATCHDOG_SEC:-4.0}"
+    # Forensic fix (logs_2, RunPod RTX 5090 run 2026-09-06): the assistant was
+    # SPEAKING THE INJECTED REFERENCE ALOUD before its real answer -- turn 6
+    # audibly produced ". Class ( stock $. reflecting. move opened>" and turn 5
+    # ". As02, for $1ref> ...". The injected steps themselves are silent, but
+    # PersonaPlex's audio codebooks lag its text stream, so the acoustic
+    # rendition of those forced tokens arrives over the following steps. This
+    # keeps the outgoing audio covered (thinking sound, or silence if no clip
+    # is set) for that lag, so the user hears the waiting cue and then the real
+    # answer -- never the raw reference. Set 0 to disable the mask.
+    --ref_audio_drain_sec "${REF_AUDIO_DRAIN_SEC:-2.0}"
   )
   # Web search is what "needs live data" resolves to, so default it ON
   # whenever a key is available. Without a key the router still runs and
@@ -153,9 +163,15 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     exit 1
   }
   [[ -e "$IM/search_helpers.py" ]] || { echo "Missing required search path: $IM/search_helpers.py" >&2; exit 1; }
+  # Loaded and cached ONCE at engine init (never re-read per turn). Warn rather
+  # than exit: a missing clip degrades to forced silence during the wait, which
+  # is worse UX but not a broken pipeline.
+  [[ -e "$THINKING_SOUND_PATH" ]] || {
+    echo "[warn] thinking sound not found at $THINKING_SOUND_PATH -- searches will wait in silence" >&2
+  }
 fi
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="707e98be6dc4153bb16b065856ddb010fa084693b038f551aa87a85509bc720c"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="fb0aa2ffef2290b274472e6a98bc400337de8ad1e26f123925dc0fe140c11fb7"
  ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"

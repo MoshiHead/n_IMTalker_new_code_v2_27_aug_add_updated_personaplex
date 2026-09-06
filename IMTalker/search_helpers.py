@@ -1002,39 +1002,90 @@ def _content_words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9$£€%.,]+", text.lower()) if len(w) > 2 and w not in _STOPWORDS}
 
 
+# Abbreviations that must NOT end a sentence. Splitting on them truncated a
+# real answer in logs_2 ("The Alphabet Inc. Class C Capital Stock (GOOG) stock
+# price today is $339.52" became the headless fragment "Class C Capital Stock
+# (GOOG) stock price today is $339.52"), which the assistant then read aloud.
+_ABBREV_RE = re.compile(
+    r"\b(?:Inc|Ltd|Corp|Co|Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|approx|U\.S|U\.K|E\.U|a\.m|p\.m)\.$",
+    re.IGNORECASE,
+)
+# A figure the question is probably asking for: 4,452.77 / $339.52 / 12% / £3,288
+_NUMERIC_FACT_RE = re.compile(r"[$£€¥]\s?\d|\d[\d,]*\.\d|\b\d[\d,]{2,}\b|\d+(?:\.\d+)?\s?%")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Sentence split that does not break on common abbreviations."""
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    merged: list[str] = []
+    for part in parts:
+        if merged and _ABBREV_RE.search(merged[-1]):
+            merged[-1] = f"{merged[-1]} {part}"
+        else:
+            merged.append(part)
+    return [p.strip() for p in merged if p.strip()]
+
+
 def extract_best_sentence(transcript: str, hits: list[dict], max_chars: int = 200) -> tuple[str, float]:
     """Single best-scoring extractive sentence, plus its confidence score, so
     a caller can decide whether extraction alone is good enough to skip an
-    LLM compression pass entirely (that pass is what was costing 2-5s per
-    search turn -- see ContextCompressor -- almost all of it GPU contention
-    with the concurrently-running PersonaPlex/avatar pipeline, not the 1.5B
-    model itself being slow in isolation).
+    LLM compression pass entirely (that pass cost 2-5s per search turn -- see
+    ContextCompressor -- almost all of it GPU contention with the
+    concurrently-running PersonaPlex/avatar pipeline).
 
-    Same scoring as summarize_web_fallback (content-word overlap normalized
-    by sentence length), refactored to expose the top score instead of only
-    the joined top-N text. Returns ("", 0.0) if no usable sentence exists."""
+    Scoring is QUERY COVERAGE (what share of the question's content words the
+    sentence addresses) plus a strong bonus for actually containing a figure.
+    It is deliberately NOT the `overlap / sqrt(len)` used by
+    summarize_web_fallback: that formula rewards shortness so hard that in
+    logs_2 it picked the page-title fragment "Gold Price Chart." (score 1.155)
+    over the sentence that carried the real answer ("Gold Price per Ounce:
+    $4,452.77, ..."), and the assistant then said "Gold Price Chart." out
+    loud instead of the price. Fragments shorter than _MIN_ANSWER_CHARS are
+    dropped outright for the same reason.
+
+    Returns ("", 0.0) if no usable sentence exists."""
+    _MIN_ANSWER_CHARS = 30
+
     full_text = " ".join(c.get("text", "") for c in hits)
-    sentences = re.split(r"(?<=[.!?])\s+", full_text.strip())
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
+    sentences = _split_sentences(full_text)
+    # Prefer properly terminated sentences; scraped passages often end
+    # mid-fragment in nav/alt-text junk.
     terminated = [s for s in sentences if s.endswith((".", "!", "?"))]
     if terminated:
         sentences = terminated
+    sentences = [s for s in sentences if len(s) >= _MIN_ANSWER_CHARS]
     if not sentences:
         return "", 0.0
 
     query_words = _content_words(transcript)
+    if not query_words:
+        return "", 0.0
+
     scored = []
     for idx, sent in enumerate(sentences):
         sent_words = _content_words(sent)
         if not sent_words:
             continue
-        overlap = len(query_words & sent_words)
-        scored.append((overlap / (len(sent_words) ** 0.5), idx))
+        coverage = len(query_words & sent_words) / len(query_words)
+        if coverage <= 0:
+            continue
+        score = coverage
+        if _NUMERIC_FACT_RE.search(sent):
+            # The overwhelming majority of questions that reach a web search
+            # here ask for a value (price/rate/score/"how much"), so a
+            # sentence carrying a figure is far more likely to be the answer
+            # than a same-topic sentence without one.
+            score += 0.40
+        # Mild preference for a readable, speakable length: very long scraped
+        # runs are worse to read aloud than a focused sentence.
+        if len(sent) > 180:
+            score -= 0.10
+        scored.append((score, -len(sent), idx))
     if not scored:
         return "", 0.0
 
     scored.sort(reverse=True)
-    best_score, best_idx = scored[0]
+    best_score, _, best_idx = scored[0]
     return sentences[best_idx][:max_chars], float(best_score)
 
 

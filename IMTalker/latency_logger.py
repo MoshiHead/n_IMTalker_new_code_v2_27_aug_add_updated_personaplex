@@ -48,6 +48,13 @@ STAGE_LABELS: dict[str, str] = {
     "compression_extractive": "extract best sentence from results (no LLM, ~0ms)",
     "compression_llm": "compress results into one spoken sentence (LLM)",
     "compression_fallback": "multi-sentence extractive fallback (LLM produced nothing usable)",
+    # -- Avatar/video pipeline. logs_2 showed STT (0.4ms), routing (0.0ms) and
+    # the model's first audible frame (+0.05s) were all fast while the answer
+    # still felt seconds late, which puts the delay squarely in these stages.
+    "avatar_fm": "avatar: flow-matching motion generation (GPU)",
+    "avatar_helium": "avatar: helium feature extraction (GPU)",
+    "avatar_render_jpeg": "avatar: render frames + JPEG encode (GPU)",
+    "avatar_first_chunk_publish": "avatar: FIRST chunk generated -> queued for sending",
     "ref_encode": "tokenize + trim the grounding text",
     "lookup_inject": "inject the <lookup> 'please wait' note",
     "ref_inject": "inject the grounding <ref> into the live context",
@@ -69,6 +76,16 @@ MARK_LABELS: dict[str, str] = {
     "lookup_injected": "'please wait' note handed to the model",
     "first_word": "assistant's FIRST spoken word (what the user feels)",
     "answer_complete": "assistant's LAST word of the answer",
+    # -- Audio DELIVERY, kept strictly separate from text completion. --------
+    # answer_complete only proves the model emitted its last TEXT token. These
+    # three prove audio was generated, that it reached the websocket, and that
+    # it finished. A turn with answer_complete but no audio_stream_started is
+    # exactly the "text answer completes, but audio is never produced" failure.
+    "first_audio_generated": "model produced its first non-silent audio frame",
+    "audio_stream_started": "first audio packet actually written to the websocket",
+    "audio_stream_completed": "last audio packet written to the websocket",
+    "thinking_sound_started": "waiting/notification sound began",
+    "thinking_sound_stopped": "waiting/notification sound ended",
 }
 
 # Headline metrics, in the order they are printed. (field, label)
@@ -77,6 +94,9 @@ HEADLINES: list[tuple[str, str]] = [
     ("question_to_search_done_s", "question -> search results in"),
     ("question_to_grounding_s", "question -> grounding sentence ready"),
     ("question_to_ref_injected_s", "question -> grounding given to model"),
+    ("question_to_first_audio_s", "question -> first audio GENERATED"),
+    ("question_to_audio_out_s", "question -> first audio SENT to browser"),
+    ("generated_to_sent_s", "audio generated -> audio sent (pipeline delay)"),
     ("question_to_first_word_s", "question -> FIRST spoken word"),
     ("question_to_answer_complete_s", "question -> answer fully spoken"),
     ("answer_speaking_s", "duration of the spoken answer"),
@@ -336,12 +356,20 @@ class LatencyLogger:
             ("question_to_search_done_s", "search_done"),
             ("question_to_grounding_s", "grounding_ready"),
             ("question_to_ref_injected_s", "ref_injected"),
+            ("question_to_first_audio_s", "first_audio_generated"),
+            ("question_to_audio_out_s", "audio_stream_started"),
             ("question_to_first_word_s", "first_word"),
             ("question_to_answer_complete_s", "answer_complete"),
         ]
         for field, mark in pairs:
             if mark in rec.marks:
                 m[field] = round(rec.marks[mark], 3)
+        # The gap nothing else measures: how long generated audio sat in the
+        # avatar/chunking/prebuffer path before it was actually sent out.
+        if "first_audio_generated" in rec.marks and "audio_stream_started" in rec.marks:
+            m["generated_to_sent_s"] = round(
+                max(0.0, rec.marks["audio_stream_started"] - rec.marks["first_audio_generated"]), 3
+            )
         if "first_word" in rec.marks and "answer_complete" in rec.marks:
             m["answer_speaking_s"] = round(
                 max(0.0, rec.marks["answer_complete"] - rec.marks["first_word"]), 3

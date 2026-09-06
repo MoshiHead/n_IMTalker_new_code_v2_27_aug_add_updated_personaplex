@@ -214,6 +214,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         max_suppress_sec: float = 3.0,
         inject_tokens_per_tick: int = 4,
         post_inject_watchdog_sec: float = 4.0,
+        ref_audio_drain_sec: float = 2.0,
         **kwargs,
     ) -> None:
         self.tf_capture_layer = int(capture_layer)
@@ -269,6 +270,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # itself fix the underlying model behavior; it makes it fast to
         # detect and measure so the fix can be verified on real hardware.
         self.post_inject_watchdog_sec = float(post_inject_watchdog_sec)
+        # How long outgoing audio stays masked after a <ref> injection, to
+        # cover the codec's trailing rendition of the injected reference text
+        # (see _finish_ref_injection). 0 disables the mask.
+        self.ref_audio_drain_sec = max(0.0, float(ref_audio_drain_sec))
 
         # "Thinking sound": played in place of the model's own audio ONLY while
         # an online search is actually running (see _start_thinking_sound and
@@ -513,6 +518,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     # RMS level at which the model's own output counts as "it has started
     # speaking". Used for the time-to-first-word latency metric.
     _SPEECH_RMS_THRESHOLD = 0.006
+    # Hard ceiling on buffered STT frames for ONE utterance (~60s at 80ms per
+    # frame). Nobody speaks a single question for a minute; anything longer
+    # means the VAD is stuck, and concatenating it would rebuild exactly the
+    # runaway-transcript bug seen in logs_2 (see _stt_step).
+    _STT_MAX_BUFFER_FRAMES = 750
 
     # Conservative default: _install_graph_hidden_capture() sets the real value
     # for whichever step override it installs. Only the PersonaPlex graphed
@@ -548,6 +558,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.stt_in_utterance = False
         self.stt_silence_frame_count = 0
         self.stt_last_vad_end = False
+        # perf_counter reading of the moment the current utterance's first
+        # real (non-padding) STT token arrived -- see _stt_step's buffer reset.
+        self._utterance_started_perf: float | None = None
         self.search_turn_epoch = 0
         self.search_ref_committed_this_turn = False
         self.search_awaiting_ref = False
@@ -605,10 +618,24 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # metric for a full-duplex model.
         self._turn_awaiting_first_speech = False
         self._turn_first_speech_epoch = 0
+        # Audio DELIVERY state, deliberately separate from the text/turn state
+        # above. "The answer finished" and "the user heard the answer" are
+        # different claims and logs_2 could not tell them apart.
+        self._turn_first_audio_generated_perf: float | None = None
+        self._turn_audio_stream_started = False
+        self._turn_last_audio_out_perf: float | None = None
+        self._turn_audio_packets_out = 0
         self.search_thinking_active = False
         self._thinking_sound_cursor = 0
         self._thinking_sound_started_at = 0.0
         self._thinking_sound_play_count = 0
+        # Stop armed by _defer_thinking_sound_stop but not yet taken, as
+        # (reason, reason_text, turn_id); None when nothing is armed.
+        self._thinking_stop_pending: tuple[str, str, object] | None = None
+        # Remaining 80ms steps for which outgoing audio stays masked after a
+        # <ref> injection, so the codec's trailing rendition of the injected
+        # reference text is never heard. See _finish_ref_injection.
+        self._ref_audio_drain_remaining: int = 0
         # When suppression (forced silence) started, for the max_suppress_sec
         # cap in _consume_pending. None means "not currently suppressing".
         self._suppress_started_perf: float | None = None
@@ -679,10 +706,31 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         if self.thinking_sound_pcm is None or self.search_thinking_active:
             return
         self.search_thinking_active = True
+        self._thinking_stop_pending = None
+        self._ref_audio_drain_remaining = 0
         self._thinking_sound_started_at = time.perf_counter()
         self._thinking_sound_play_count = 1
-        self.conv_logger.event("thinking_sound_start", transcript=transcript)
+        self.conv_logger.event(
+            "thinking_sound_start",
+            f"THINKING_SOUND START turn_id={turn_id} reason=web_search_required",
+            transcript=transcript,
+        )
         self.conv_logger.narrate_thinking_start(turn_id)
+
+    def _defer_thinking_sound_stop(self, turn_id, reason: str, reason_text: str) -> None:
+        """Arm the stop instead of stopping now.
+
+        The ref tokens are about to be force-fed; PersonaPlex's audio codebooks
+        trail its text stream, so for a short window after the injection the
+        decoder is still emitting the acoustic realisation of the injected
+        reference (logs_2 turn 6: the assistant audibly said ". Class ( stock
+        $. reflecting. move opened>" before its real answer). The assistant is
+        therefore NOT yet "ready to produce the real answer" at this point --
+        the thinking sound keeps covering the wait, and the real stop fires
+        from _step() once _ref_audio_drain_remaining reaches zero."""
+        if not self.search_thinking_active:
+            return
+        self._thinking_stop_pending = (str(reason), str(reason_text), turn_id)
 
     def _stop_thinking_sound(self, turn_id, reason: str, reason_text: str) -> None:
         """Shared stop logic for both the real-ref-ready and filler-timeout
@@ -691,12 +739,16 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         if not self.search_thinking_active:
             return
         self.search_thinking_active = False
+        self._thinking_stop_pending = None
+        self._ref_audio_drain_remaining = 0
         duration_s = max(0.0, time.perf_counter() - self._thinking_sound_started_at)
         clip_duration_s = (
             self.thinking_sound_pcm.shape[0] / TARGET_SR if self.thinking_sound_pcm is not None else 0.0
         )
         self.conv_logger.event(
-            "thinking_sound_stop", reason=reason, duration_s=round(duration_s, 2),
+            "thinking_sound_stop",
+            f"THINKING_SOUND STOP duration={duration_s:.3f}s turn_id={turn_id} reason={reason}",
+            reason=reason, duration_s=round(duration_s, 3),
             play_count=self._thinking_sound_play_count,
         )
         self.conv_logger.narrate_thinking_stop(
@@ -706,6 +758,42 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             getattr(self, "_latency_turn_id", None), "thinking_sound", duration_s,
             note=f"stopped because {reason}, played {self._thinking_sound_play_count}x",
         )
+
+    def note_audio_streamed(self, packet_rms: float) -> None:
+        """Called by the websocket audio sender the instant a packet is written
+        to the socket -- the ONLY point in the pipeline that can honestly say
+        the user was sent audio.
+
+        Runs on the asyncio loop, not the GPU thread. It only touches plain
+        attributes and LatencyLogger.mark/count, which take their own lock, so
+        it needs no lock of its own and cannot block the sender. Silent packets
+        (including the thinking sound's own frames, which are gated out
+        upstream by force_idle) are ignored so the mark means 'the answer
+        started reaching the user', not 'a packet existed'."""
+        try:
+            if packet_rms < self._SPEECH_RMS_THRESHOLD:
+                return
+            now = time.perf_counter()
+            self._turn_last_audio_out_perf = now
+            self._turn_audio_packets_out += 1
+            if self._turn_audio_stream_started:
+                return
+            self._turn_audio_stream_started = True
+            turn_id = self._latency_turn_id
+            if turn_id is None:
+                return
+            self.conv_logger.latency.mark(
+                turn_id, "audio_stream_started",
+                "first audio packet written to the websocket", at=now,
+            )
+            generated = self._turn_first_audio_generated_perf
+            if generated is not None:
+                self.conv_logger.latency.count(
+                    turn_id,
+                    generated_to_sent_s=round(max(0.0, now - generated), 3),
+                )
+        except Exception:
+            pass
 
     def _inject_tokens(self, tokens: list[int]) -> None:
         """Force-feed text tokens into the live stream. reset_streaming() is
@@ -759,7 +847,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         if vad_heads and len(vad_heads) > 2:
             vad_score = float(vad_heads[2][0, 0, 0].cpu().item())
         if stt_tokens is not None:
-            self.stt_token_buffer.append(stt_tokens[:, :1, :].cpu())
+            frame_tokens = stt_tokens[:, :1, :].cpu()
             text_token = stt_tokens[0, 0, 0].item()
             if text_token not in (0, self.stt_padding_token_id):
                 if not self.stt_in_utterance:
@@ -769,8 +857,33 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     # it is hearing now.
                     self._utterance_start_audio_text_len = len(self.audio_text)
                     self._answer_end_perf = self._last_text_emit_perf
+                    # CRITICAL (forensic fix, logs_2/conversation.log): drop
+                    # everything buffered BEFORE this utterance began. The
+                    # buffer used to be cleared only after a turn completed,
+                    # so every frame emitted while the assistant was speaking
+                    # -- 50+ seconds of it in that log (stt_frames_decoded
+                    # grew 226 -> 716) -- was concatenated into the next
+                    # transcript. That is what turned "What is today's Tesla
+                    # stock market price?" into "Life is, today is, test
+                    # life, stock market price." and then sent that garbage
+                    # to the search API as the query. Only the current
+                    # utterance's frames may reach decode_stt_tokens().
+                    dropped = len(self.stt_token_buffer)
+                    self.stt_token_buffer = []
+                    self._utterance_started_perf = time.perf_counter()
+                    if dropped:
+                        self.conv_logger.latency.count(
+                            self._latency_turn_id, stt_pre_utterance_frames_dropped=dropped,
+                        )
                 self.stt_in_utterance = True
                 self.stt_last_vad_end = False
+            self.stt_token_buffer.append(frame_tokens)
+            # Safety net: even inside one utterance the buffer must not grow
+            # without bound (a stuck VAD would otherwise rebuild the same
+            # runaway-concatenation bug). 60s of frames is far longer than
+            # any real spoken question.
+            if len(self.stt_token_buffer) > self._STT_MAX_BUFFER_FRAMES:
+                self.stt_token_buffer = self.stt_token_buffer[-self._STT_MAX_BUFFER_FRAMES:]
         if vad_score > self.vad_threshold:
             self.stt_silence_frame_count += 1
         else:
@@ -780,6 +893,20 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             and not self.stt_last_vad_end
         )
         self.stt_last_vad_end = self.stt_silence_frame_count >= self._VAD_SILENCE_FRAMES_REQUIRED
+        # Second layer of the same forensic fix: while we are definitively
+        # NOT inside a user utterance and the VAD says the floor is silent,
+        # nothing buffered can belong to a future question. Anything the STT
+        # emits here is echo of the assistant's own voice through the user's
+        # speakers, or a hallucination on room noise -- both of which are
+        # non-padding tokens that survive decode_stt_tokens()'s padding
+        # filter, which is exactly how 50s of them ended up prepended to a
+        # real question in logs_2.
+        if (
+            not self.stt_in_utterance
+            and self.stt_token_buffer
+            and self.stt_silence_frame_count >= self._VAD_SILENCE_FRAMES_REQUIRED
+        ):
+            self.stt_token_buffer = []
         if vad_fired and self.stt_in_utterance and self.stt_token_buffer and not self.search_awaiting_ref:
             # Since injection is now spread across several ticks
             # (search_awaiting_ref goes False the instant it STARTS, not when
@@ -891,8 +1018,18 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     "stt_decode": stt_decode_elapsed,
                     "transcript_check": transcript_check_elapsed,
                 }
+                # stt_utterance_sec is the headline STT health number: it is
+                # how much audio actually went into this transcript. Before
+                # the buffer fix it silently grew to ~57s (logs_2), which is
+                # what corrupted the transcripts; it should now track the
+                # length of the spoken question (a few seconds).
+                utt_started = getattr(self, "_utterance_started_perf", None)
                 self._pending_stt_counts = {
                     "stt_frames_decoded": n_stt_frames,
+                    "stt_utterance_sec": round(n_stt_frames * MIMI_FRAME_SIZE / TARGET_SR, 2),
+                    "stt_utterance_wall_sec": (
+                        round(t_speech_end - utt_started, 2) if utt_started else None
+                    ),
                     "transcript_tokens": len(transcript_token_ids),
                     "transcript_chars": len(transcript),
                 }
@@ -1353,6 +1490,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         try:
             self._latency_turn_id = turn_id
             self._turn_text_token_count = 0
+            self._turn_first_audio_generated_perf = None
+            self._turn_audio_stream_started = False
+            self._turn_last_audio_out_perf = None
+            self._turn_audio_packets_out = 0
             self.conv_logger.latency.start_turn(
                 turn_id,
                 t0=self._turn_speech_end_perf if self._turn_speech_end_perf is not None else time.perf_counter(),
@@ -1385,12 +1526,31 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     turn_id, "answer_complete", "last text token of the reply",
                     at=end_perf,
                 )
+            # Audio delivery is closed out SEPARATELY from answer_complete.
+            # answer_complete above only says the model emitted its last text
+            # token; these two say whether any audio reached the user at all.
+            last_out = self._turn_last_audio_out_perf
+            if last_out is not None:
+                self.conv_logger.latency.mark(
+                    turn_id, "audio_stream_completed",
+                    "last audio packet written to the websocket", at=last_out,
+                )
             self.conv_logger.latency.count(
                 turn_id,
                 answer_chars=len(response),
                 answer_words=len(response.split()),
                 answer_text_tokens=self._turn_text_token_count,
+                audio_packets_streamed=self._turn_audio_packets_out,
+                # The explicit "text finished but nothing was ever heard"
+                # signal the previous logs could not distinguish.
+                audio_delivered=bool(self._turn_audio_packets_out),
             )
+            if not self._turn_audio_packets_out:
+                self.conv_logger.event(
+                    "audio_never_delivered",
+                    "answer text completed but NO audio packet was ever sent for this turn",
+                    turn=turn_id,
+                )
             self.conv_logger.latency.finish_turn(turn_id, response=response, outcome=outcome)
             self._latency_turn_id = None
             self._answer_end_perf = None
@@ -1427,6 +1587,33 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         continue cleanly from the completed injection."""
         self.suppress_text_until_ref = False
         self._suppress_started_perf = None
+        # -- Keep the outgoing audio masked while the injected text's own
+        # audio drains out of the model. ------------------------------------
+        # Forensic finding (logs_2/conversation.log): the assistant was
+        # SPEAKING THE INJECTED REFERENCE ALOUD, tag fragments and all --
+        # turn 6 said ". Class ( stock $. reflecting. move opened> Google
+        # Class C Capital Stock price today is $339.52." and turn 5 said
+        # ". As02, for $1ref> ...". _inject_tokens forces each <ref> token
+        # into the text stream with moshi_tokens pinned to the zero frame, so
+        # the injected STEPS themselves are silent -- but PersonaPlex's audio
+        # codebooks lag its text stream, so the acoustic realisation of those
+        # forced words comes out over the FOLLOWING normal steps and was
+        # being decoded and streamed to the user. Masking roughly one step
+        # per injected token (plus margin) covers exactly that drain window,
+        # after which the model's real, grounded answer begins.
+        #
+        # The leak observed in logs_2 is the TAIL of the ref (8-10 words), not
+        # the whole thing -- i.e. it is the fixed acoustic lag of the codec, so
+        # the mask is a fixed WALL-CLOCK window (--ref_audio_drain_sec), not a
+        # per-token count. A per-token count would mask for tens of seconds on
+        # a long ref and swallow the real answer with it.
+        drain_steps = max(0, int(round(self.ref_audio_drain_sec * (TARGET_SR / MIMI_FRAME_SIZE))))
+        self._ref_audio_drain_remaining = drain_steps
+        self.conv_logger.latency.count(
+            self._latency_turn_id,
+            ref_audio_drain_steps=drain_steps,
+            ref_audio_drain_sec=round(self.ref_audio_drain_sec, 2),
+        )
         n_tokens = self._injection_total_tokens
         token_text = self._injection_token_text
         self._turn_timing_stages["ref_inject"] = elapsed
@@ -1593,7 +1780,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             # duration of the injection -- released in _finish_ref_injection,
             # not here. See that method's docstring for why.
             self.suppress_text_until_ref = True
-            self._stop_thinking_sound(self.search_turn_epoch, "ref_ready", "the answer was ready")
+            self._defer_thinking_sound_stop(
+                self.search_turn_epoch, "ref_ready", "the answer was ready",
+            )
             self._injection_started_perf = time.perf_counter()
             self._injection_total_tokens = len(ref_tokens)
             self._injection_token_text = self.tokenizer.decode(ref_tokens)
@@ -1612,7 +1801,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             # Force ON for the same reason as the ref-ready branch above --
             # released in _finish_ref_injection, not here.
             self.suppress_text_until_ref = True
-            self._stop_thinking_sound(
+            self._defer_thinking_sound_stop(
                 self.search_turn_epoch, "filler_timeout",
                 "the search was taking too long, so the assistant moved on with what it had",
             )
@@ -1664,7 +1853,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.search_hard_disabled = True
                 self.search_awaiting_ref = False
                 self._injection_in_progress = None
-                self.search_thinking_active = False
+                # Through _stop_thinking_sound (not a bare flag assignment) so
+                # the stop is still logged with its duration on this path.
+                self._stop_thinking_sound(
+                    self.search_turn_epoch, "pipeline_error",
+                    "the search pipeline failed, so the assistant answered without it",
+                )
+                self._thinking_stop_pending = None
+                self._ref_audio_drain_remaining = 0
                 self.suppress_text_until_ref = False
         # Also keep polling while a ref/fallback injection is being drained
         # across multiple ticks (self._injection_in_progress) -- that flag
@@ -1688,7 +1884,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.search_hard_disabled = True
                 self.search_awaiting_ref = False
                 self._injection_in_progress = None
-                self.search_thinking_active = False
+                # Through _stop_thinking_sound (not a bare flag assignment) so
+                # the stop is still logged with its duration on this path.
+                self._stop_thinking_sound(
+                    self.search_turn_epoch, "pipeline_error",
+                    "the search pipeline failed, so the assistant answered without it",
+                )
+                self._thinking_stop_pending = None
+                self._ref_audio_drain_remaining = 0
                 self.suppress_text_until_ref = False
 
         # While a search is in flight, hand the model its own "say nothing"
@@ -1800,6 +2003,17 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     self._turn_first_speech_epoch, "first_word",
                     f"microphone backlog {backlog_s:.2f}s at this moment",
                 )
+                # Distinct from first_word (a text/turn concept) and from
+                # answer_complete (text only): this is the instant the MODEL
+                # produced audible PCM. note_audio_streamed() later records
+                # when that audio actually left the websocket; the difference
+                # is the avatar/chunking/prebuffer delay, which nothing in the
+                # pipeline measured before.
+                self._turn_first_audio_generated_perf = time.perf_counter()
+                self.conv_logger.latency.mark(
+                    self._turn_first_speech_epoch, "first_audio_generated",
+                    "model emitted its first non-silent frame (not yet sent)",
+                )
                 self.conv_logger.latency.count(
                     self._turn_first_speech_epoch,
                     input_backlog_s_at_first_word=round(backlog_s, 3),
@@ -1812,9 +2026,26 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # downstream to stay visually idle rather than lip-syncing to this
         # non-speech sound (its RMS is well above the speech threshold, so
         # without this the avatar would appear to "talk").
+        #
+        # The sound also covers the ref-audio DRAIN window: after the injected
+        # tokens are fed, PersonaPlex's audio codebooks are still emitting the
+        # reference text as speech (logs_2). _defer_thinking_sound_stop() armed
+        # the stop instead of taking it, and _finish_ref_injection() set the
+        # drain budget; the stop only lands once that budget is spent, i.e.
+        # once the model is genuinely about to speak its own answer.
+        if self._ref_audio_drain_remaining > 0:
+            self._ref_audio_drain_remaining -= 1
+            if self._ref_audio_drain_remaining == 0 and self._thinking_stop_pending is not None:
+                reason, reason_text, stop_turn_id = self._thinking_stop_pending
+                self._stop_thinking_sound(stop_turn_id, reason, reason_text)
         force_idle = False
         if self.search_thinking_active and self.thinking_sound_pcm is not None:
             reply_pcm = self._next_thinking_sound_chunk()
+            force_idle = True
+        elif self._ref_audio_drain_remaining > 0:
+            # No clip configured to cover the drain -- emit silence rather than
+            # letting the leaked reference audio reach the user.
+            reply_pcm = np.zeros_like(reply_pcm)
             force_idle = True
 
         reply_rms = float(np.sqrt(np.mean(np.square(reply_pcm, dtype=np.float32))))
@@ -3485,6 +3716,13 @@ class LiveHeliumFMOptions(BaseOptions):
                  "and close the turn's latency record out, instead of waiting for the next question's "
                  "VAD to notice minutes later.",
         )
+        parser.add_argument(
+            "--ref_audio_drain_sec", type=float, default=2.0,
+            help="Seconds of outgoing audio kept masked (thinking sound, or silence if no clip is "
+                 "configured) after a <ref>/fallback injection completes. PersonaPlex's audio "
+                 "codebooks trail its text stream, so without this the injected reference text is "
+                 "briefly SPOKEN ALOUD before the real answer. 0 disables the mask.",
+        )
         return parser
 
 
@@ -3576,6 +3814,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 max_suppress_sec=float(getattr(args, "max_suppress_sec", 3.0)),
                 inject_tokens_per_tick=int(getattr(args, "inject_tokens_per_tick", 4)),
                 post_inject_watchdog_sec=float(getattr(args, "post_inject_watchdog_sec", 4.0)),
+                ref_audio_drain_sec=float(getattr(args, "ref_audio_drain_sec", 2.0)),
             )
         return moshi_engine
 
@@ -4327,11 +4566,24 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         # reserve before audio advances its playback clock.
                         for pkt in staged_frames:
                             _enqueue_frame(pkt)
-                        for audio_step in used_audio:
+                        # force_idle marks a step whose outgoing audio is the
+                        # thinking sound or the post-injection mask, not the
+                        # assistant's answer. It travels with the packet so the
+                        # sender does not mistake the waiting cue for the
+                        # answer starting to stream (audio_stream_started).
+                        # Indexed defensively: used_audio/used_steps are sliced
+                        # together on every path that sets both, but one branch
+                        # reassigns used_steps alone.
+                        masked_flags = [bool(s.get("force_idle")) for s in used_steps]
+                        for audio_idx, audio_step in enumerate(used_audio):
                             _enqueue_audio({
                                 "audio_packet_index": staged_audio_seq,
                                 "audio_pcm": np.asarray(audio_step, dtype=np.float32).copy(),
                                 "created_at": time.perf_counter(),
+                                "masked": (
+                                    masked_flags[audio_idx]
+                                    if audio_idx < len(masked_flags) else False
+                                ),
                             })
                             staged_audio_seq += 1
 
@@ -4359,6 +4611,31 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             f"abs={emitted}",
                             flush=True,
                         )
+
+                        # The avatar chunk pipeline is where logs_2 says the
+                        # user-perceived delay actually lives: STT was 0.4ms,
+                        # routing 0.0ms and the model's first audible frame
+                        # landed +0.05s after the question -- yet the answer
+                        # was felt seconds later. Everything between those two
+                        # points is this block, and until now it existed only
+                        # as a stdout print, invisible to the latency report.
+                        if reply_engine is not None:
+                            turn_id = getattr(reply_engine, "_latency_turn_id", None)
+                            if turn_id is not None:
+                                lat = reply_engine.conv_logger.latency
+                                lat.accumulate(turn_id, "avatar_fm", float(fm_info["fm_ms"]) / 1000.0)
+                                lat.accumulate(turn_id, "avatar_helium", float(fm_info["helium_ms"]) / 1000.0)
+                                lat.accumulate(turn_id, "avatar_render_jpeg", chunk_wall_ms / 1000.0)
+                                if reply_avatar_chunk_idx <= 1:
+                                    lat.stage(
+                                        turn_id, "avatar_first_chunk_publish",
+                                        produce_latency_ms / 1000.0,
+                                        note=(
+                                            f"audio_chunk_sec={float(getattr(args, 'audio_chunk_sec', 0.0)):.1f} "
+                                            f"-- time from the model producing this chunk's audio to the "
+                                            f"chunk (audio+{n_frames} frames) being queued for sending"
+                                        ),
+                                    )
 
                 fut_done = asyncio.run_coroutine_threadsafe(frame_q.put(None), event_loop)
                 try:
@@ -4554,6 +4831,15 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             break
                         packets_sent += 1
                         bytes_sent += len(opus_payload)
+                        # Record DELIVERY, not generation. Everything upstream
+                        # (answer_complete, first_audio_generated) proves the
+                        # model produced something; only this proves it was
+                        # sent. Masked packets (thinking sound / post-injection
+                        # cover) are excluded: they are loud, so counting them
+                        # would report the waiting cue as the answer starting.
+                        # Cheap, non-blocking, never raises.
+                        if reply_engine is not None and not packet.get("masked"):
+                            reply_engine.note_audio_streamed(packet_rms)
 
                     if packets_sent and packets_sent % 50 == 0:
                         print(
