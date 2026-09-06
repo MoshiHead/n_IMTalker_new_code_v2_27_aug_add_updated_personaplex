@@ -3967,6 +3967,19 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             "loaded": engine is not None,
         })
 
+    # Shared A/V clock, written by each sender as it releases a packet and
+    # sampled by the health logger. Both values are "media seconds emitted
+    # since this generation's epoch", so their DIFFERENCE is the real
+    # audio/video offset the user perceives -- the one number that says whether
+    # lip-sync is holding or drifting apart over a long answer.
+    #
+    # It lives at build_app scope, NOT inside a handler, because audio and
+    # video are streamed by two SEPARATE websocket endpoints
+    # (/ws/conversation and /ws/video). Defined inside either one, the other
+    # cannot see it -- which is how logs_7 ended up reporting av_offset_ms
+    # climbing to 220s: video_media_s was simply never written.
+    av_clock = {"audio_media_s": 0.0, "video_media_s": 0.0, "generation": 0}
+
     @app.websocket("/ws/video")
     async def video_stream(ws: WebSocket):
         await ws.accept()
@@ -3987,6 +4000,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         frames_sent = 0
         starvation_events = 0
         starve_start: float | None = None
+        # Same anti-burst contract the audio sender uses: one frame period
+        # minus a little slack, so normal pacing is never slowed but a
+        # backlog can never be flushed back to back.
+        native_frame_sec = 1.0 / float(args.fps)
+        min_frame_interval_s = max(0.001, native_frame_sec - 0.005)
+        next_frame_wall = send_start_wall
         print(
             f"[AJ][VIDEO] connected session={session_id[:8]} "
             f"queued={frame_q.qsize()}",
@@ -4016,6 +4035,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     active_generation = packet_generation
                     base_frame_idx = int(packet["frame_number"])
                     send_start_wall = await _get_split_media_epoch(session)
+                    next_frame_wall = send_start_wall
                     await ws.send_json({
                         "type": "video_epoch",
                         "generation": active_generation,
@@ -4034,10 +4054,29 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     starve_start = None
 
                 idx = int(packet["frame_number"])
+                # Anti-burst floor, matching _audio_sender's min_send_interval_s.
+                # Without it, any moment where target_t has fallen into the past
+                # -- a render hiccup, GPU contention, the producer briefly
+                # falling behind 25 fps -- makes this loop dump every queued
+                # frame back to back as fast as the socket accepts them. The
+                # browser sees a burst, then starvation, then another burst,
+                # while the audio path (which IS throttled) keeps its own pace:
+                # video judder plus lip-sync that slips further off with every
+                # stall. Both paths have to degrade the same way or they drift.
                 target_t = send_start_wall + (idx - base_frame_idx) / float(args.fps)
+                target_t = max(target_t, next_frame_wall)
                 sleep_s = target_t - time.perf_counter()
                 if sleep_s > 0:
                     await asyncio.sleep(sleep_s)
+                next_frame_wall = max(target_t, time.perf_counter()) + min_frame_interval_s
+                # Publish this sender's media clock so the health logger can
+                # report a REAL audio/video offset. logs_7 reported
+                # av_offset_ms growing to 220s purely because video_media_s was
+                # never written -- the instrumentation lived in _reply_sender,
+                # which is dead code (see below); this handler is the one that
+                # actually streams video.
+                av_clock["video_media_s"] = (idx - base_frame_idx) / float(args.fps)
+                av_clock["generation"] = active_generation
 
                 if packet.get("ws_kind") == "bytes":
                     await ws.send_bytes(packet["data"])
@@ -4103,12 +4142,6 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         media_generation = 0
         playback_interrupt_event = threading.Event()
         playback_state = {"active": False, "hold": 0}
-        # Shared A/V clock, written by each sender as it releases a packet and
-        # sampled by the health logger. Both values are "media seconds emitted
-        # since this generation's epoch", so their DIFFERENCE is the real
-        # audio/video offset the user perceives -- the one number that says
-        # whether lip-sync is holding or drifting apart over a long answer.
-        av_clock = {"audio_media_s": 0.0, "video_media_s": 0.0, "generation": 0}
         mic_overlap_packets = 0
         session_started = threading.Event()
         last_mic_level_log_wall = 0.0
@@ -4268,9 +4301,18 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         * TARGET_SR / MIMI_FRAME_SIZE
                     )),
                 )
+                # Hard ceiling on any single hold. Deliberately SHORT: the gate
+                # is evaluated from the previous iteration, so an answer can
+                # start while a hold is already running, and whatever remains
+                # of that hold delays the answer's onset. Throttling an idle
+                # backlog does not need a long hold -- a short one simply
+                # re-enters next iteration while the model stays idle -- but a
+                # long one would cost real time at exactly the wrong moment.
+                _EVENT_Q_HOLD_MAX_S = 0.2
                 print(
                     f"[EVENT-BACKLOG] backpressure cap: {_EVENT_Q_MAX} events "
-                    f"(~{_EVENT_Q_MAX * 0.08:.2f}s); 0 disables",
+                    f"(~{_EVENT_Q_MAX * 0.08:.2f}s), idle-gated, max hold "
+                    f"{_EVENT_Q_HOLD_MAX_S:.1f}s; 0 disables",
                     flush=True,
                 )
                 print(
@@ -4337,10 +4379,33 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     # and the A/V timeline is never touched. Mic audio that
                     # arrives meanwhile accumulates in the engine's own input
                     # buffer, which is already measured and handled.
-                    if _EVENT_Q_MAX > 0:
+                    # GATED ON IDLE, and time-bounded (logs_7). PersonaPlex is a
+                    # full-duplex model that must keep stepping at 12.5Hz; hold
+                    # it and the conversation itself breaks, not just its
+                    # timing. logs_7 showed exactly that: frame_q saturates at
+                    # FRAME_Q_BACKPRESS (32) as a matter of DESIGN -- the GPU
+                    # thread publishes 50 frames per chunk, so it is over the
+                    # limit the instant a chunk lands and blocks until the
+                    # sender drains it. That block propagates into
+                    # persona_event_q, which hit this cap (event_q reached 6,
+                    # 7, 7, 8 in the health log), and the worker then stopped
+                    # stepping the model. Turn 5 produced answer_chars=0,
+                    # answer_text_tokens=0, audio_packets_streamed=0 -- the
+                    # model never generated at all.
+                    #
+                    # So: only hold while the model is IDLE (the startup mic
+                    # burst, and the dead air between turns, which is where the
+                    # backlog is actually built), never once it is speaking,
+                    # and never for longer than one chunk period regardless.
+                    if (
+                        _EVENT_Q_MAX > 0
+                        and consecutive_silent_events >= _BACKLOG_SILENCE_RUN
+                    ):
+                        _hold_deadline = time.perf_counter() + _EVENT_Q_HOLD_MAX_S
                         while (
                             persona_event_q.qsize() >= _EVENT_Q_MAX
                             and not pipeline_stop_event.is_set()
+                            and time.perf_counter() < _hold_deadline
                         ):
                             time.sleep(0.004)
 
@@ -5042,136 +5107,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             session["media_epoch"] = media_epoch
                     return media_epoch
 
-            async def _reply_sender() -> None:
-                """Wait for prebuffer, then drain frame_q at 25fps."""
-                assert frame_q is not None
-                send_start_wall = await _get_media_epoch()
-                frames_sent = 0
-                starvation_events = 0
-                starve_start: float | None = None
-                ws_closed = False
-                # Same anti-burst contract the audio sender uses, one frame
-                # period minus a small slack so normal pacing is never slowed.
-                native_frame_sec = 1.0 / float(args.fps)
-                min_frame_interval_s = max(0.001, native_frame_sec - 0.005)
-                next_frame_wall = send_start_wall
-                active_generation = 0
-                base_frame_idx: int | None = None
-                dropped_stale_frames = 0
-
-                q_depth_at_start = frame_q.qsize()
-                print(
-                    f"[SENDER] prebuffer filled, starting pacing with "
-                    f"{q_depth_at_start} frames queued",
-                    flush=True,
-                )
-
-                while True:
-                    if ws_closed:
-                        break
-
-                    try:
-                        packet = frame_q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        if send_start_wall is not None and starve_start is None:
-                            starve_start = time.perf_counter()
-                            starvation_events += 1
-                        await asyncio.sleep(0.004)
-                        continue
-
-                    if packet is None:
-                        break
-
-                    if starve_start is not None:
-                        gap_ms = 1000.0 * (time.perf_counter() - starve_start)
-                        if gap_ms > 100:
-                            print(
-                                f"[SENDER] STARVED {gap_ms:.0f}ms "
-                                f"(event #{starvation_events}) "
-                                f"frame_q={frame_q.qsize()} sent={frames_sent}",
-                                flush=True,
-                            )
-                        starve_start = None
-
-                    # -- Generation filtering + epoch re-anchoring ------------
-                    # The audio sender has always done both of these; this one
-                    # did neither, which meant that after ANY media reset
-                    # (a barge-in, or the idle resync) audio restarted its
-                    # timeline at a fresh epoch with a rebased packet index
-                    # while video kept the ORIGINAL epoch and an absolute frame
-                    # counter that never rebased. The two clocks then diverge
-                    # without bound -- the mouth drifts further behind the
-                    # voice the longer the session runs, and stale frames from
-                    # a cancelled generation are still painted. Audio and video
-                    # must re-anchor to the SAME new origin, together.
-                    session = split_sessions.get(session_id)
-                    if session is None:
-                        break
-                    packet_generation = int(packet.get("media_generation", 0))
-                    if packet_generation != _media_generation(session):
-                        dropped_stale_frames += 1
-                        continue
-                    idx = int(packet["frame_number"])
-                    if packet_generation != active_generation or base_frame_idx is None:
-                        active_generation = packet_generation
-                        base_frame_idx = idx
-                        send_start_wall = await _get_media_epoch()
-                        next_frame_wall = send_start_wall
-                        print(
-                            f"[MEDIA-EPOCH][VIDEO] generation={active_generation} "
-                            f"base_frame={base_frame_idx}",
-                            flush=True,
-                        )
-                    idx = idx - base_frame_idx
-
-                    # Anti-burst floor, mirroring the audio sender's
-                    # min_send_interval_s. Without it, any moment where
-                    # target_t has fallen into the past (a render stall, a GPU
-                    # hiccup, an idle media resync) made this loop dump every
-                    # queued frame back to back as fast as the websocket would
-                    # take them -- the browser sees a burst, then starvation,
-                    # then another burst, which is seen as the video freezing
-                    # and jumping while the audio (which IS throttled) keeps
-                    # its own pace. The two paths must degrade the same way or
-                    # they drift apart precisely when the pipeline is already
-                    # under stress.
-                    target_t = send_start_wall + idx / float(args.fps)
-                    target_t = max(target_t, next_frame_wall)
-                    sleep_s = target_t - time.perf_counter()
-                    if sleep_s > 0:
-                        await asyncio.sleep(sleep_s)
-                    next_frame_wall = max(target_t, time.perf_counter()) + min_frame_interval_s
-                    av_clock["video_media_s"] = idx * native_frame_sec
-                    av_clock["generation"] = active_generation
-
-                    try:
-                        async with ws_send_lock:
-                            if packet.get("ws_kind") == "bytes":
-                                await ws.send_bytes(packet["data"])
-                            else:
-                                await ws.send_json(packet["msg"])
-                    except (WebSocketDisconnect, RuntimeError, Exception):
-                        ws_closed = True
-                        break
-                    frames_sent += 1
-
-                    late_s = time.perf_counter() - target_t
-                    if late_s > 0.5:
-                        print(
-                            f"[SENDER] video frame {idx} is {late_s*1000:.0f}ms late",
-                            flush=True,
-                        )
-
-                    if frames_sent % 50 == 0:
-                        q_depth = frame_q.qsize()
-                        elapsed = time.perf_counter() - send_start_wall
-                        print(
-                            f"[SENDER] sent={frames_sent} frame={idx} "
-                            f"frame_q={q_depth} "
-                            f"elapsed={elapsed:.1f}s "
-                            f"starve_events={starvation_events}",
-                            flush=True,
-                        )
+            # NOTE: a second frame sender (_reply_sender) used to live here. It was
+            # never started -- no asyncio.create_task() ever referenced it -- so it
+            # was dead code that silently absorbed two rounds of A/V fixes (logs_6,
+            # logs_7 both showed video_media_s stuck at 0.0 because the
+            # instrumentation was in here). Video is streamed by the
+            # @app.websocket("/ws/video") handler; fix that one.
 
             async def _audio_sender() -> None:
                 assert audio_q is not None
