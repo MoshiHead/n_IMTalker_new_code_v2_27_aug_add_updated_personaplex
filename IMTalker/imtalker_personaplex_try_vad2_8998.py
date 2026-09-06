@@ -3638,12 +3638,22 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--frame_q_backpressure", type=int, default=160)
         parser.add_argument(
             "--max_event_backlog_sec", type=float, default=0.6,
-            help="Forensic fix (logs_4, 2026-09-06): persona_event_q is the one unbounded queue "
-                 "between PersonaPlex and the websocket, and the GPU thread is pinned to real-time "
-                 "by frame_q backpressure, so a backlog built during startup warmup never drains -- "
-                 "logs_4 measured a rock-steady 9.1-9.6s of standing latency on EVERY turn. Above "
-                 "this depth, stale SILENT events are dropped (never speech, never the thinking "
-                 "sound), which re-levels the pipeline during any pause. 0 disables draining.",
+            help="Backpressure cap on persona_event_q, the queue where this pipeline's standing "
+                 "latency actually accumulates (logs_4: a rock-steady 9.1-9.6s on every turn; "
+                 "logs_6: 10.72s while both media queues were normal). The producer waits when the "
+                 "queue is this deep instead of racing ahead of the real-time consumer. Nothing is "
+                 "dropped -- earlier versions dropped events or media here and that skewed the "
+                 "audio/video timelines apart and deleted answers. 0 disables the cap.",
+        )
+        parser.add_argument(
+            "--media_resync_lag_sec", type=float, default=0.0,
+            help="DEFAULT OFF. When >0, an idle media resync drops audio_q+frame_q together and "
+                 "re-anchors both senders to one epoch once this much media is queued after ~1.5s "
+                 "of silence. Disabled because logs_6 showed any threshold near the pipeline's "
+                 "normal buffer (a 2.0s chunk published at once, frame_q allowed to 1.28s) makes it "
+                 "fire continuously -- it ran every 5s and delivered 228-248 char answers as 6-42 "
+                 "audio packets. Only enable with a value well ABOVE normal video_q_latency_s, and "
+                 "re-verify audio_packets_streamed on real hardware.",
         )
         parser.add_argument(
             "--suppress_media_watchdog_sec", type=float, default=3.0,
@@ -4219,22 +4229,50 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 # cannot outlive one turn no matter what RMS pattern follows.
                 suppress_media_started_perf: float | None = None
                 SUPPRESS_MEDIA_MAX_SEC = float(getattr(args, "suppress_media_watchdog_sec", 3.0))
-                # Max standing depth of persona_event_q, in events (80ms each),
-                # before stale SILENT events start being dropped. See the drain
-                # block below for why this queue is the one that matters.
                 consecutive_silent_events = 0
                 last_health_log = 0.0
                 _HEALTH_LOG_INTERVAL_S = 5.0
                 # ~1.5s of unbroken silence before an idle resync is allowed.
                 _BACKLOG_SILENCE_RUN = int(round(1.5 * TARGET_SR / MIMI_FRAME_SIZE))
                 _BACKLOG_SILENCE_RMS = 0.003
-                # How much queued media (audio OR video, whichever is worse)
-                # counts as standing latency worth reclaiming, and the minimum
-                # spacing between resyncs. See the resync block below.
-                _RESYNC_MAX_LAG_S = max(0.0, float(getattr(args, "max_event_backlog_sec", 0.6)))
+                # Idle media resync -- DEFAULT OFF (logs_6). It was previously
+                # wired to max_event_backlog_sec (0.6s), which is far BELOW the
+                # pipeline's designed steady-state media buffer: the GPU thread
+                # publishes a whole 2.0s chunk at once (50 frames) and frame_q
+                # is deliberately allowed to hold up to frame_q_backpressure
+                # (32 frames = 1.28s). logs_6 measured video_q_latency_s at
+                # 1.2-4.16s in NORMAL operation, so the condition was
+                # permanently true and the resync fired every 5s -- the rate
+                # limiter, not the symptom. Each fire dropped audio_q and
+                # frame_q, so answers of 228-248 chars were delivered as 6-42
+                # packets (0.5-3.4s): the reported "every answer is muted",
+                # plus constant generation bumps that shredded the video.
+                #
+                # It also targeted the wrong queue. logs_6 shows the standing
+                # backlog lives in persona_event_q (event_q_latency_s up to
+                # 10.72s) which a media resync never touches, while audio_q sat
+                # at 0.0-0.4s the whole run. That backlog is now handled by
+                # real backpressure below -- no dropping, so nothing can go
+                # missing and the A/V timeline is never skewed.
+                _RESYNC_MAX_LAG_S = max(0.0, float(getattr(args, "media_resync_lag_sec", 0.0)))
                 _RESYNC_MIN_INTERVAL_S = 5.0
                 last_resync_perf = 0.0
                 resync_count = 0
+                # Cap on persona_event_q depth, in 80ms events. This is the
+                # queue logs_6 caught growing to 10.72s; holding the producer
+                # here bounds standing latency without discarding anything.
+                _EVENT_Q_MAX = max(
+                    0,
+                    int(round(
+                        float(getattr(args, "max_event_backlog_sec", 0.6))
+                        * TARGET_SR / MIMI_FRAME_SIZE
+                    )),
+                )
+                print(
+                    f"[EVENT-BACKLOG] backpressure cap: {_EVENT_Q_MAX} events "
+                    f"(~{_EVENT_Q_MAX * 0.08:.2f}s); 0 disables",
+                    flush=True,
+                )
                 print(
                     f"[MEDIA-RESYNC] idle resync threshold: {_RESYNC_MAX_LAG_S:.2f}s of queued media "
                     f"after ~{_BACKLOG_SILENCE_RUN * 0.08:.1f}s of silence; 0 disables",
@@ -4274,6 +4312,38 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     if not session_started.is_set() or _persona_buffered_samples() < MIMI_FRAME_SIZE:
                         time.sleep(0.002)
                         continue
+                    # -- Backpressure, not dropping (logs_6 root cause) --------
+                    # The standing latency this pipeline suffers from lives
+                    # HERE, in persona_event_q: logs_6 measured it at 134
+                    # events == 10.72s while audio_q sat at 0.0-0.4s and
+                    # frame_q at its normal 1.2-2.0s. It grows because this
+                    # worker is gated only by mic availability, while the GPU
+                    # thread downstream is pinned to real time by frame_q
+                    # backpressure. At session start mic_q was 166 packets
+                    # deep, so this loop raced far ahead of the wall clock and
+                    # the gap it opened was never recoverable.
+                    #
+                    # Two previous attempts fixed it by DISCARDING media (drop
+                    # silent events; drop both media queues on a resync). Both
+                    # broke streaming, because everything downstream paces on
+                    # absolute index-derived schedules -- removing media
+                    # removes schedule time without removing wall time, which
+                    # skews audio and video apart permanently, and in logs_6
+                    # deleted the answers outright.
+                    #
+                    # Backpressure has neither failure mode: the producer
+                    # simply waits for the consumer, so the queue is bounded,
+                    # standing latency is capped, NOTHING is ever discarded,
+                    # and the A/V timeline is never touched. Mic audio that
+                    # arrives meanwhile accumulates in the engine's own input
+                    # buffer, which is already measured and handled.
+                    if _EVENT_Q_MAX > 0:
+                        while (
+                            persona_event_q.qsize() >= _EVENT_Q_MAX
+                            and not pipeline_stop_event.is_set()
+                        ):
+                            time.sleep(0.004)
+
                     buffered_before = _persona_buffered_samples()
                     ready_before = buffered_before // MIMI_FRAME_SIZE
                     if priority_stream is None:
