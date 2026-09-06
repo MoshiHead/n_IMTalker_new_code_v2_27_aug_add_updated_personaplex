@@ -171,7 +171,7 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
   }
 fi
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="fb0aa2ffef2290b274472e6a98bc400337de8ad1e26f123925dc0fe140c11fb7"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="3c630c54e8acfa75910ba47d86a9c4a8347e79c0d1bf3aab243b707da519f183"
  ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"
@@ -229,4 +229,5 @@ exec python -u "$IM/imtalker_personaplex_try_vad2_8998.py" \
  --silence_helium_path "$ROOT/checkpoints/personaplex_lookahead_rms_adapter/stats/silence_helium_mean.pt" \
  --jpeg_quality 90 --device cuda --reply_audio_gain 1.0 --output_audio_codec opus \
  --blink_motion_path "$ROOT/checkpoints/lora/3robert_audio3_ditto_static_motion.pt" --enable_eye_blink_composite \
+ --suppress_media_watchdog_sec "${SUPPRESS_MEDIA_WATCHDOG_SEC:-3.0}" \
  "${SEARCH_ARGS[@]}"

@@ -1441,6 +1441,25 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             if my_epoch != self.search_turn_epoch or self.search_ref_committed_this_turn:
                 return
 
+            # Rewrite the raw grounding fact into plain spoken English before
+            # PersonaPlex ever sees it -- "$309.32" becomes "three hundred
+            # nine dollars and thirty-two cents", "(TSLA)" is dropped, "+0.23%"
+            # becomes "up zero point two three percent". Deterministic
+            # (no LLM call, no added latency), and this is the ONE place all
+            # three grounding sources (extractive/llm/fallback) funnel
+            # through, so it applies uniformly. `grounding` above (already
+            # logged via turn_ground/GROUND) stays the raw fact for
+            # comparison; only the text actually injected is rewritten.
+            raw_grounding = grounding
+            spoken_grounding = search_helpers.normalize_for_speech(grounding) if grounding else grounding
+            if spoken_grounding != raw_grounding:
+                self.conv_logger.event(
+                    "spoken_summary",
+                    f"SPOKEN_SUMMARY turn={my_epoch}",
+                    raw_summary=raw_grounding, spoken_summary=spoken_grounding,
+                )
+            grounding = spoken_grounding
+
             ref_content = grounding.strip() if grounding else (
                 "There's no specific information available on this, so answer from general knowledge."
             )
@@ -3568,6 +3587,14 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--prebuffer_chunks", type=int, default=3, help="Avatar chunks queued before sender starts pacing")
         parser.add_argument("--frame_q_backpressure", type=int, default=160)
         parser.add_argument(
+            "--suppress_media_watchdog_sec", type=float, default=3.0,
+            help="Forensic fix (logs_3, 2026-09-06): a native-barge-in media suppression that never "
+                 "sees its exact expected RMS pattern (silence, then a fresh loud reply) used to stay "
+                 "suppressed for the REST OF THE SESSION -- every subsequent turn's audio (search or "
+                 "not) was silently dropped before ever reaching the frame/audio queues. This caps how "
+                 "long suppression can last before it is force-cleared unconditionally.",
+        )
+        parser.add_argument(
             "--file_chunk_lookahead",
             type=int,
             default=0,
@@ -4105,6 +4132,18 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 suppress_media = False
                 suppression_silence_confirmed = False
                 suppression_silence_steps = 0
+                # Forensic fix (logs_3, 2026-09-06): a barge-in that never sees
+                # its exact expected RMS pattern (3 near-silent steps, then one
+                # >=0.012 "fresh reply" step) left suppress_media stuck True for
+                # the REST OF THE SESSION -- every event from that point was
+                # silently dropped before reaching persona_event_q, so no audio
+                # was ever enqueued again (turns 7, 8, 9 in that log: 0 packets
+                # each, search and non-search turns alike -- proving it was not
+                # a search-specific bug but this suppression state leaking
+                # across turns). This wall-clock cap guarantees suppression
+                # cannot outlive one turn no matter what RMS pattern follows.
+                suppress_media_started_perf: float | None = None
+                SUPPRESS_MEDIA_MAX_SEC = float(getattr(args, "suppress_media_watchdog_sec", 3.0))
 
                 async def _cancel_stale_media(generation: int) -> None:
                     nonlocal media_epoch
@@ -4152,12 +4191,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     for event in events:
                         input_rms = float(event.get("input_rms", 0.0) or 0.0)
                         reply_rms = float(event.get("reply_rms", 0.0) or 0.0)
+                        event_force_idle = bool(event.get("force_idle"))
                         if playback_interrupt_event.is_set():
                             playback_interrupt_event.clear()
                             generation = _trigger_media_reset()
                             suppress_media = True
                             suppression_silence_confirmed = False
                             suppression_silence_steps = 0
+                            suppress_media_started_perf = time.perf_counter()
                             print(
                                 f"[PLAYBACK-BARGE] generation={generation} "
                                 f"step={event.get('step',-1)} input_rms={input_rms:.5f} "
@@ -4166,7 +4207,37 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             )
 
                         if suppress_media:
-                            if not suppression_silence_confirmed:
+                            # Watchdog FIRST, unconditionally: no RMS pattern
+                            # below gets a chance to leave suppression stuck
+                            # past this deadline, regardless of what the
+                            # thinking sound / masked audio / a quiet real
+                            # answer happens to measure.
+                            if (
+                                suppress_media_started_perf is not None
+                                and (time.perf_counter() - suppress_media_started_perf) > SUPPRESS_MEDIA_MAX_SEC
+                            ):
+                                print(
+                                    f"[PLAYBACK-BARGE] WATCHDOG force-clearing suppression after "
+                                    f"{SUPPRESS_MEDIA_MAX_SEC:.1f}s stuck -- resuming media unconditionally "
+                                    f"step={event.get('step',-1)}",
+                                    flush=True,
+                                )
+                                suppress_media = False
+                                suppression_silence_confirmed = False
+                                suppression_silence_steps = 0
+                                suppress_media_started_perf = None
+                            elif event_force_idle:
+                                # Thinking sound / post-injection mask: not the
+                                # model's own content either way. Drop it (media
+                                # stays suppressed) without letting its RMS
+                                # feed the silence/resume state machine --
+                                # otherwise the loud thinking-sound clip could
+                                # never look "silent enough" to confirm, or
+                                # (worse) could look like the "fresh reply"
+                                # that ends suppression before the model has
+                                # actually said anything.
+                                continue
+                            elif not suppression_silence_confirmed:
                                 if reply_rms <= 0.003:
                                     suppression_silence_steps += 1
                                 else:
@@ -4179,16 +4250,21 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                         flush=True,
                                     )
                                 continue
-                            if reply_rms < 0.012:
+                            elif reply_rms < 0.012:
                                 continue
-                            suppress_media = False
-                            suppression_silence_confirmed = False
-                            suppression_silence_steps = 0
-                            print(
-                                f"[PLAYBACK-BARGE] fresh reply starts "
-                                f"step={event.get('step',-1)} reply_rms={reply_rms:.5f}",
-                                flush=True,
-                            )
+                            else:
+                                suppress_media = False
+                                suppression_silence_confirmed = False
+                                suppression_silence_steps = 0
+                                suppress_media_started_perf = None
+                                print(
+                                    f"[PLAYBACK-BARGE] fresh reply starts "
+                                    f"step={event.get('step',-1)} reply_rms={reply_rms:.5f}",
+                                    flush=True,
+                                )
+
+                        if suppress_media:
+                            continue
 
                         with media_generation_lock:
                             event["media_generation"] = int(split_sessions[session_id]["media_generation"])
@@ -4812,7 +4888,20 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         float(np.sqrt(np.mean(np.square(audio_pcm, dtype=np.float32))))
                         if audio_pcm.size else 0.0
                     )
-                    if packet_rms >= 0.006:
+                    # Forensic fix (logs_3, 2026-09-06): playback_state["active"]
+                    # feeds the mic-overlap barge-in trigger below (receive loop:
+                    # mic_rms >= 0.020 while "active" => playback_interrupt_event
+                    # fires, media resets, and the suppress/resume state machine
+                    # takes over -- see _persona_priority_worker). The thinking
+                    # sound is loud (it must be, to be audible) but it is NOT the
+                    # assistant's answer, so it must never look like "assistant
+                    # speaking" to that detector -- treating it as such let a
+                    # multi-second search turn's own waiting cue trip a false
+                    # barge-in, whose recovery condition (silence, then a fresh
+                    # loud reply) is exactly what search/injection makes hard to
+                    # satisfy, this being how the mute in logs_3 got triggered.
+                    effective_rms = 0.0 if packet.get("masked") else packet_rms
+                    if effective_rms >= 0.006:
                         playback_state["active"] = True
                         playback_state["hold"] = 4
                     elif int(playback_state["hold"]) > 0:

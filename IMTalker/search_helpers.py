@@ -1134,6 +1134,173 @@ def summarize_web_fallback(
     return " ".join(sentences[i] for i in chosen)[:max_chars]
 
 
+# ── Spoken-English normalization for the text PersonaPlex will actually say ──
+#
+# The grounding text (extractive, LLM-compressed, or fallback -- all three)
+# comes straight from web pages: currency symbols, +/- percent deltas, ticker
+# parentheses, markdown, raw URLs. Handed to a SPEECH model verbatim, those
+# symbols either get dropped silently or mangled -- and the user's own
+# examples ("$309.32" -> should be "three hundred nine dollars and thirty-two
+# cents") ask for genuinely spoken-English numbers, not just symbol removal.
+# Deterministic, pure Python, no model call: this must never add latency to
+# either the search path or (especially) the normal no-search path, which
+# never calls it at all.
+
+_ONES = [
+    "", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen",
+]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+_DIGIT_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+_SCALES = [(10 ** 12, "trillion"), (10 ** 9, "billion"), (10 ** 6, "million"), (10 ** 3, "thousand")]
+_MAX_SPOKEN_INT = 10 ** 15  # beyond this, spelling out digits stops being natural -- leave as-is
+
+
+def _int_to_words(n: int) -> str:
+    """American short-scale integer -> words. Pure Python, no dependency."""
+    if n < 0:
+        return f"negative {_int_to_words(-n)}"
+    if n < 20:
+        return _ONES[n] if n else "zero"
+    if n < 100:
+        tens, rem = divmod(n, 10)
+        return _TENS[tens] + (f"-{_ONES[rem]}" if rem else "")
+    if n < 1000:
+        hundreds, rem = divmod(n, 100)
+        return _ONES[hundreds] + " hundred" + (f" {_int_to_words(rem)}" if rem else "")
+    for scale_val, scale_name in _SCALES:
+        if n >= scale_val:
+            major, rem = divmod(n, scale_val)
+            out = f"{_int_to_words(major)} {scale_name}"
+            return out + (f" {_int_to_words(rem)}" if rem else "")
+    return str(n)  # unreachable given the scale table above
+
+
+def _spell_digits(digits: str) -> str:
+    """Read a digit string one digit at a time -- 'point two three', not
+    'point twenty-three'. This is how humans read a decimal fraction aloud."""
+    return " ".join(_DIGIT_WORDS[int(ch)] for ch in digits if ch.isdigit())
+
+
+# sing_major, plur_major, sing_minor, plur_minor
+_CURRENCY_WORDS = {
+    "$": ("dollar", "dollars", "cent", "cents"),
+    "£": ("pound", "pounds", "penny", "pence"),
+    "€": ("euro", "euros", "cent", "cents"),
+    "¥": ("yen", "yen", "", ""),
+}
+_COMPACT_SCALE_WORDS = {"K": "thousand", "M": "million", "B": "billion", "T": "trillion"}
+
+# Compact suffixed amounts FIRST ("$4.20T", "£3,288.91K" if that ever occurs) --
+# must run before the plain-amount pattern below, or it would match just the
+# "$4.20" prefix and leave a dangling "T". Both money patterns also swallow a
+# leading +/- (a price delta, e.g. "-$5.00") so that sign is spoken as
+# "up"/"down" rather than surviving as a stray math symbol -- per-instruction,
+# a lone hyphen elsewhere in the sentence (a real hyphenated word) is left
+# alone since it is never adjacent to a currency symbol or digit.
+# No leading `\s?` before the sign/symbol: that would consume whatever
+# whitespace precedes the amount (e.g. the space in "is $338.72") as PART of
+# the match, and the replacement text (which starts directly with a word, no
+# leading space) would then glue onto the previous word -- "is$338.72" ->
+# "isthree hundred...". Starting the match exactly at the sign/symbol leaves
+# that whitespace untouched in the surrounding text.
+_COMPACT_MONEY_RE = re.compile(r"([+-])?([$£€¥])\s?(\d[\d,]*(?:\.\d+)?)\s?([KMBT])\b")
+_PLAIN_MONEY_RE = re.compile(r"([+-])?([$£€¥])\s?(\d[\d,]*)(?:\.(\d{1,2}))?")
+# +/-1.11%, 0.23%, 12% -- the sign, if present, becomes "up"/"down" rather
+# than being dropped, since it is often the actual point of the sentence
+# ("reflecting a +0.23% move").
+_PERCENT_RE = re.compile(r"([+-])?\s?(\d+)(?:\.(\d+))?\s?%")
+# Ticker parentheticals: (TSLA), (GOOG), (GOOGL), (BRK.A) -- short, all-caps,
+# optionally dotted. Deliberately narrow so it never eats a genuine
+# parenthetical remark, which is never all-caps/short like this.
+_TICKER_PAREN_RE = re.compile(r"\s?\([A-Z]{1,6}(?:\.[A-Z]{1,3})?\)")
+_URL_RE = re.compile(r"https?://\S+")
+_MARKDOWN_TABLE_PIPE_RE = re.compile(r"\s*\|\s*")
+_EMPTY_PAREN_RE = re.compile(r"\(\s*\)")
+# Anything with a currency symbol or a "%" is handled (and its sign consumed)
+# above. This is the leftover case: a bare signed number with neither, e.g.
+# "337.12 +2.10" from a raw index quote. Not preceded by a word char or a
+# decimal point, so it never touches a real hyphenated word or a negative
+# exponent -- only a sign standing immediately in front of a digit.
+_STRAY_SIGNED_NUMBER_RE = re.compile(r"(?<![\w.])([+-])\s?(?=\d)")
+# A lone +/- used as a bullet/separator with no adjacent number at all.
+_STRAY_MATH_SYMBOL_RE = re.compile(r"(?<=\s)[+-](?=\s)")
+
+
+def _compact_money_sub(m: "re.Match[str]") -> str:
+    sign, symbol, num, suffix = m.group(1), m.group(2), m.group(3).replace(",", ""), m.group(4)
+    sign_word = {"+": "up ", "-": "down "}.get(sign or "", "")
+    scale_word = _COMPACT_SCALE_WORDS[suffix]
+    _, plur_major, _, _ = _CURRENCY_WORDS.get(symbol, _CURRENCY_WORDS["$"])
+    if "." in num:
+        whole_s, frac_s = num.split(".", 1)
+        num_words = f"{_int_to_words(int(whole_s or 0))} point {_spell_digits(frac_s)}"
+    else:
+        num_words = _int_to_words(int(num))
+    return f"{sign_word}{num_words} {scale_word} {plur_major}"
+
+
+def _plain_money_sub(m: "re.Match[str]") -> str:
+    sign, symbol, whole_s, frac_s = m.group(1), m.group(2), m.group(3).replace(",", ""), m.group(4)
+    sign_word = {"+": "up ", "-": "down "}.get(sign or "", "")
+    sing_major, plur_major, sing_minor, plur_minor = _CURRENCY_WORDS.get(symbol, _CURRENCY_WORDS["$"])
+    whole = int(whole_s)
+    if whole >= _MAX_SPOKEN_INT:
+        return m.group(0)  # absurdly large -- leave the digits alone
+    major_word = sing_major if whole == 1 else plur_major
+    phrase = f"{sign_word}{_int_to_words(whole)} {major_word}"
+    if frac_s and sing_minor:
+        cents = int(frac_s.ljust(2, "0")[:2])
+        if cents:
+            minor_word = sing_minor if cents == 1 else plur_minor
+            phrase += f" and {_int_to_words(cents)} {minor_word}"
+    return phrase
+
+
+def _percent_sub(m: "re.Match[str]") -> str:
+    sign, whole_s, frac_s = m.group(1), m.group(2), m.group(3)
+    sign_word = {"+": "up ", "-": "down "}.get(sign or "", "")
+    whole_words = _int_to_words(int(whole_s))
+    if frac_s:
+        return f"{sign_word}{whole_words} point {_spell_digits(frac_s)} percent"
+    return f"{sign_word}{whole_words} percent"
+
+
+def normalize_for_speech(text: str) -> str:
+    """Rewrite web-search grounding text into plain spoken English before it
+    is handed to PersonaPlex, so the model speaks natural language instead of
+    reading symbols aloud (or silently dropping them).
+
+    Deterministic and pure-Python -- no model call, ~microseconds. Only
+    touches patterns unambiguous enough to convert safely (currency amounts,
+    percentages with a recognizable currency/percent symbol, ticker
+    parentheticals, markdown/URL artifacts); a bare number with no symbol is
+    left untouched; per-instruction, blindly spelling out every digit in a
+    sentence makes it LESS natural, not more, so this stays conservative.
+    """
+    if not text:
+        return text
+    out = text
+    out = _URL_RE.sub("", out)
+    out = _MARKDOWN_TABLE_PIPE_RE.sub(", ", out)
+    out = _SYMBOL_RE.sub("", out)  # markdown emphasis/heading/code marks
+    out = _COMPACT_MONEY_RE.sub(_compact_money_sub, out)
+    out = _PLAIN_MONEY_RE.sub(_plain_money_sub, out)
+    out = _PERCENT_RE.sub(_percent_sub, out)
+    out = _STRAY_SIGNED_NUMBER_RE.sub(lambda m: {"+": "up ", "-": "down "}[m.group(1)], out)
+    out = _STRAY_MATH_SYMBOL_RE.sub(",", out)
+    out = _TICKER_PAREN_RE.sub("", out)
+    out = _EMPTY_PAREN_RE.sub("", out)
+    # Collapse whitespace/punctuation artifacts left behind by the removals
+    # above (double spaces, a space before a period, doubled commas).
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([.,!?])", r"\1", out)
+    out = re.sub(r",\s*,", ",", out)
+    out = re.sub(r",\s*\.", ".", out)
+    return out.strip()
+
+
 # ── Context compressor: small LLM, query + top-k hits -> 1-2 sentence grounding ──
 
 class ContextCompressor:
@@ -1237,7 +1404,11 @@ class ContextCompressor:
             "include its units or currency.\n"
             "- Ignore advertising, slogans, menus, image captions, and any text about the "
             "website or seller itself -- it is page furniture, not an answer.\n"
-            "- Plain text only: no markdown, no lead-in phrase, no citation markers.\n"
+            "- Plain text only: no markdown, no lead-in phrase, no citation markers, no ticker "
+            "symbols in parentheses like (TSLA).\n"
+            "- Write it the way a person would SAY it out loud, not how it is printed: numbers "
+            "and prices are still fine as digits ($309.32, 12%), just avoid raw table/list "
+            "formatting and symbols that only make sense written down.\n"
             "- Never reply conversationally. You are writing a fact for someone else to say, "
             "not talking to the user: never answer with \"Yes, I can...\", an offer to help, or "
             "a comment about yourself. If the question is phrased as a yes/no request such as "
