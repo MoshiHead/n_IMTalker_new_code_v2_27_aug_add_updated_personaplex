@@ -260,6 +260,31 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # multiple 80ms ticks (a few tokens per tick) keeps each _step() call
         # close to its normal budget.
         self.inject_tokens_per_tick = max(1, int(inject_tokens_per_tick))
+        # Guard rail (logs_5): every forced token is an extra lm_gen._step(),
+        # i.e. an extra 12.5Hz frame of model time. Push too many into one
+        # 80ms tick and PersonaPlex's audio codebooks fall out of step with
+        # its text codebook -- it keeps emitting correct TEXT while its audio
+        # goes silent, which is exactly how logs_5 muted all three search
+        # answers at 14/tick (logs_4 at 4/tick delivered 79/72/97 packets on
+        # the same questions). Loud warning rather than a hard clamp, so the
+        # value stays tunable for anyone re-testing on real hardware.
+        if self.inject_tokens_per_tick > self._INJECT_TOKENS_PER_TICK_SAFE_MAX:
+            msg = (
+                f"inject_tokens_per_tick={self.inject_tokens_per_tick} exceeds the "
+                f"empirically safe maximum of {self._INJECT_TOKENS_PER_TICK_SAFE_MAX}. "
+                f"On RunPod RTX 5090 this desynchronised PersonaPlex's text and audio "
+                f"codebooks and muted every web-search answer (logs_5). Re-verify "
+                f"search AUDIO -- not just answer text -- before trusting this value."
+            )
+            print(f"[liveTryPlasticity][search] WARNING {msg}", flush=True)
+            try:
+                runtime_logging.log_event(
+                    runtime_logging.get_system_logger(), "Search", "inject_rate_above_safe_max",
+                    inject_tokens_per_tick=self.inject_tokens_per_tick,
+                    safe_max=self._INJECT_TOKENS_PER_TICK_SAFE_MAX,
+                )
+            except Exception:
+                pass
 
         # Forensic finding: turn 7 was a CLEAN, on-time <ref> injection (no
         # timeout, no fallback) that was still followed by 50+ seconds of
@@ -528,6 +553,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     # means the VAD is stuck, and concatenating it would rebuild exactly the
     # runaway-transcript bug seen in logs_2 (see _stt_step).
     _STT_MAX_BUFFER_FRAMES = 750
+    # Highest --inject_tokens_per_tick that has ever produced audible search
+    # answers on real hardware. 4 delivered 79/72/97 packets (logs_3, logs_4);
+    # 14 delivered 8/8/5 and was heard as total silence (logs_5). See the
+    # warning in __init__.
+    _INJECT_TOKENS_PER_TICK_SAFE_MAX = 6
 
     # Conservative default: _install_graph_hidden_capture() sets the real value
     # for whichever step override it installs. Only the PersonaPlex graphed
@@ -4187,6 +4217,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 # before stale SILENT events start being dropped. See the drain
                 # block below for why this queue is the one that matters.
                 dropped_backlog_events = 0
+                consecutive_silent_events = 0
+                last_health_log = 0.0
+                _HEALTH_LOG_INTERVAL_S = 5.0
+                # ~1.5s of unbroken silence before any draining is allowed.
+                _BACKLOG_SILENCE_RUN = int(round(1.5 * TARGET_SR / MIMI_FRAME_SIZE))
+                _BACKLOG_SILENCE_RMS = 0.003
                 event_backlog_max = max(
                     0,
                     int(round(
@@ -4340,23 +4376,36 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         # Dropping SILENT events is the safe way out: an 80ms
                         # gap in idle avatar animation is inaudible and
                         # invisible, and it is the only moment where dropping
-                        # cannot cut into speech. Never drops force_idle (the
-                        # thinking sound must stay continuous) and never drops
-                        # while the assistant is actually speaking, so a real
-                        # answer is delivered whole -- the queue simply
-                        # re-levels during the next silence.
+                        # cannot cut into speech.
+                        #
+                        # Only a SUSTAINED run of silence counts as drainable
+                        # idle. A single quiet frame is not idle -- it is the
+                        # gap between two words, or the low-amplitude onset of
+                        # an answer, and dropping those is how a drain starts
+                        # chewing into real speech and pulling the avatar's
+                        # motion window out of alignment with the audio it was
+                        # trained against. Requiring ~1.5s of continuous
+                        # silence means drops only ever land in the dead air
+                        # between turns, where an 80ms gap is inaudible and
+                        # invisible. force_idle (thinking sound / ref mask)
+                        # resets the run: it is not the model being idle.
+                        if event_force_idle or reply_rms > _BACKLOG_SILENCE_RMS:
+                            consecutive_silent_events = 0
+                        else:
+                            consecutive_silent_events += 1
+
                         if event_backlog_max > 0:
                             depth = persona_event_q.qsize()
                             if (
                                 depth > event_backlog_max
-                                and not event_force_idle
-                                and reply_rms <= 0.003
+                                and consecutive_silent_events >= _BACKLOG_SILENCE_RUN
                             ):
                                 dropped_backlog_events += 1
                                 if dropped_backlog_events % 25 == 1:
                                     print(
                                         f"[EVENT-BACKLOG] draining stale silence: depth={depth} "
-                                        f"> max={event_backlog_max} dropped_total={dropped_backlog_events} "
+                                        f"> max={event_backlog_max} silent_run={consecutive_silent_events} "
+                                        f"dropped_total={dropped_backlog_events} "
                                         f"(~{depth * 0.08:.2f}s of standing latency)",
                                         flush=True,
                                     )
@@ -4375,6 +4424,37 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             f"drained={len(events)} event_q={persona_event_q.qsize()}",
                             flush=True,
                         )
+
+                    # -- Pipeline-health telemetry ------------------------
+                    # Every queue that can silently accumulate, sampled on a
+                    # wall-clock interval (not per event) so it stays cheap,
+                    # and routed through the async queued logger rather than
+                    # the GPU thread doing any I/O of its own. This is what
+                    # makes "it degrades after a few turns" answerable from
+                    # the log alone instead of from a live repro.
+                    now_health = time.perf_counter()
+                    if now_health - last_health_log >= _HEALTH_LOG_INTERVAL_S:
+                        last_health_log = now_health
+                        try:
+                            vram_used_gb = vram_total_gb = None
+                            if torch.cuda.is_available():
+                                free_b, total_b = torch.cuda.mem_get_info()
+                                vram_total_gb = round(total_b / 1e9, 2)
+                                vram_used_gb = round((total_b - free_b) / 1e9, 2)
+                            runtime_logging.log_event(
+                                runtime_logging.get_system_logger(), "Pipeline", "health",
+                                event_q=persona_event_q.qsize(),
+                                frame_q=frame_q.qsize() if frame_q is not None else -1,
+                                audio_q=audio_q.qsize() if audio_q is not None else -1,
+                                mic_q=mic_q.qsize() if mic_q is not None else -1,
+                                event_q_latency_s=round(persona_event_q.qsize() * 0.08, 2),
+                                dropped_backlog_events=dropped_backlog_events,
+                                suppressed=bool(suppress_media),
+                                vram_used_gb=vram_used_gb,
+                                vram_total_gb=vram_total_gb,
+                            )
+                        except Exception:
+                            pass
                 print(f"[PERSONA-CONTINUOUS] stopped events={total_events}", flush=True)
 
             def _gpu_producer_thread() -> None:

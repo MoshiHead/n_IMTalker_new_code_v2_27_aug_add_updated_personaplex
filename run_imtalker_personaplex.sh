@@ -93,15 +93,23 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     # held forcibly silent waiting on a slow search/compress. The search
     # keeps running past this point; only the forced silence is released.
     --max_suppress_sec "${MAX_SUPPRESS_SEC:-3.0}"
-    # Spread a 20-30 token <ref> injection across several 80ms ticks instead
-    # of blocking the real-time GPU thread in one call -- keeps mic ingestion
-    # and avatar rendering close to their normal cadence during injection.
-    # Raised 4 -> 14 on logs_4 evidence: at 4/tick the ref_inject stage
-    # measured 1.40-2.44s on EVERY search turn (35-46 tokens => ~10 ticks,
-    # each a full 80ms cycle), which is pure added search latency. 14 forced
-    # LM steps cost ~40ms of the 80ms budget (gen_lm was 0.112s for a whole
-    # turn), so this stays inside one tick while cutting the stage to ~3-4.
-    --inject_tokens_per_tick "${INJECT_TOKENS_PER_TICK:-14}"
+    # Spread a <ref> injection across several 80ms ticks instead of blocking
+    # the real-time GPU thread in one call -- keeps mic ingestion and avatar
+    # rendering close to their normal cadence during injection.
+    #
+    # REVERTED 14 -> 4 (logs_5). Raising this to 14 to save ~1.2s of search
+    # latency MUTED every search answer. Each forced token is one extra
+    # lm_gen._step(), i.e. one extra 12.5Hz frame of model time, so 14/tick
+    # advances PersonaPlex ~15x faster than the wall clock it is streaming
+    # against and desynchronises its text codebook from its audio codebooks.
+    # The A/B is unambiguous -- same code, only this value differing:
+    #   logs_4 @4/tick  search turns delivered 79 / 72 / 97 audio packets
+    #   logs_5 @14/tick search turns delivered  8 /  8 /  5 audio packets
+    # and logs_5 turn 4 proves it is an AUDIO failure, not a text one: 88
+    # chars of correct answer text ("...price today is 309.32, up 0.23%...")
+    # came out with 0.64s of audible audio behind it. Do not raise this
+    # without re-testing search audio on real hardware.
+    --inject_tokens_per_tick "${INJECT_TOKENS_PER_TICK:-4}"
     # If no real text/audio follows an injection within this many seconds,
     # log it immediately instead of waiting for the next question's VAD to
     # notice minutes later (observed: turn 7 in the same run went silent for
@@ -175,7 +183,7 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
   }
 fi
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="30084f958cbf0e896a673174ee1a516c1578c63f8c11b44d4240c903004f7637"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="1684499e96af000101f2cf86f4d65289ed0abbecd170d7f4251a7e9ef9571078"
  ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"
