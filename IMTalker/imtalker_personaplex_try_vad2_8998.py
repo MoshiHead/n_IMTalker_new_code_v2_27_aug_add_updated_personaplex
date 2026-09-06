@@ -215,6 +215,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         inject_tokens_per_tick: int = 4,
         post_inject_watchdog_sec: float = 4.0,
         ref_audio_drain_sec: float = 2.0,
+        spell_ref_numbers: bool = False,
         **kwargs,
     ) -> None:
         self.tf_capture_layer = int(capture_layer)
@@ -274,6 +275,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # cover the codec's trailing rendition of the injected reference text
         # (see _finish_ref_injection). 0 disables the mask.
         self.ref_audio_drain_sec = max(0.0, float(ref_audio_drain_sec))
+        # False by default on RunPod evidence: spelling numerals out inside the
+        # <ref> is what turned $309.32 into a spoken "$39.32" in logs_4. See
+        # search_helpers.normalize_for_speech's docstring for the A/B.
+        self.spell_ref_numbers = bool(spell_ref_numbers)
 
         # "Thinking sound": played in place of the model's own audio ONLY while
         # an online search is actually running (see _start_thinking_sound and
@@ -1451,7 +1456,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             # logged via turn_ground/GROUND) stays the raw fact for
             # comparison; only the text actually injected is rewritten.
             raw_grounding = grounding
-            spoken_grounding = search_helpers.normalize_for_speech(grounding) if grounding else grounding
+            spoken_grounding = (
+                search_helpers.normalize_for_speech(grounding, spell_numbers=self.spell_ref_numbers)
+                if grounding else grounding
+            )
             if spoken_grounding != raw_grounding:
                 self.conv_logger.event(
                     "spoken_summary",
@@ -1724,9 +1732,21 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self._finish_ref_injection(kind, elapsed)
             return
 
+        # The cap must NOT fire once a grounding is already in hand or being
+        # fed. logs_4 turn 3 shows exactly that failure: "suppress_cap_released
+        # waited_s=3.1" landed while ref_inject was mid-flight (that turn's
+        # injection ran +3.14s -> +5.58s), so forced silence lifted while
+        # forced <ref> tokens were still arriving. The model then sampled its
+        # OWN text interleaved with the remaining injected tokens -- the same
+        # real/forced interleaving that moving the release into
+        # _finish_ref_injection was meant to prevent. The cap exists to stop
+        # the model hanging on a SLOW SEARCH; once the answer is here, or
+        # already going in, there is nothing left to wait for.
         if (
             self.suppress_text_until_ref
             and self._suppress_started_perf is not None
+            and self._injection_in_progress is None
+            and self.pending_ref_tokens is None
             and (time.perf_counter() - self._suppress_started_perf) > self.max_suppress_sec
         ):
             self.suppress_text_until_ref = False
@@ -3587,6 +3607,15 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--prebuffer_chunks", type=int, default=3, help="Avatar chunks queued before sender starts pacing")
         parser.add_argument("--frame_q_backpressure", type=int, default=160)
         parser.add_argument(
+            "--max_event_backlog_sec", type=float, default=0.6,
+            help="Forensic fix (logs_4, 2026-09-06): persona_event_q is the one unbounded queue "
+                 "between PersonaPlex and the websocket, and the GPU thread is pinned to real-time "
+                 "by frame_q backpressure, so a backlog built during startup warmup never drains -- "
+                 "logs_4 measured a rock-steady 9.1-9.6s of standing latency on EVERY turn. Above "
+                 "this depth, stale SILENT events are dropped (never speech, never the thinking "
+                 "sound), which re-levels the pipeline during any pause. 0 disables draining.",
+        )
+        parser.add_argument(
             "--suppress_media_watchdog_sec", type=float, default=3.0,
             help="Forensic fix (logs_3, 2026-09-06): a native-barge-in media suppression that never "
                  "sees its exact expected RMS pattern (silence, then a fresh loud reply) used to stay "
@@ -3744,6 +3773,15 @@ class LiveHeliumFMOptions(BaseOptions):
                  "VAD to notice minutes later.",
         )
         parser.add_argument(
+            "--spell_ref_numbers", action="store_true",
+            help="Spell numerals out inside the injected <ref> ('three hundred nine dollars and "
+                 "thirty-two cents' instead of '309.32 dollars'). OFF by default on RunPod "
+                 "evidence: logs_3 gave the model '$309.32' and it spoke $309.32 correctly, while "
+                 "logs_4 gave it the spelled-out form and it spoke '$39.32' -- the longer token "
+                 "sequence is re-assembled by the model and loses the magnitude. Currency/percent "
+                 "SYMBOLS are always converted to words either way; this only controls the digits.",
+        )
+        parser.add_argument(
             "--ref_audio_drain_sec", type=float, default=2.0,
             help="Seconds of outgoing audio kept masked (thinking sound, or silence if no clip is "
                  "configured) after a <ref>/fallback injection completes. PersonaPlex's audio "
@@ -3842,6 +3880,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 inject_tokens_per_tick=int(getattr(args, "inject_tokens_per_tick", 4)),
                 post_inject_watchdog_sec=float(getattr(args, "post_inject_watchdog_sec", 4.0)),
                 ref_audio_drain_sec=float(getattr(args, "ref_audio_drain_sec", 2.0)),
+                spell_ref_numbers=bool(getattr(args, "spell_ref_numbers", False)),
             )
         return moshi_engine
 
@@ -4144,6 +4183,22 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 # cannot outlive one turn no matter what RMS pattern follows.
                 suppress_media_started_perf: float | None = None
                 SUPPRESS_MEDIA_MAX_SEC = float(getattr(args, "suppress_media_watchdog_sec", 3.0))
+                # Max standing depth of persona_event_q, in events (80ms each),
+                # before stale SILENT events start being dropped. See the drain
+                # block below for why this queue is the one that matters.
+                dropped_backlog_events = 0
+                event_backlog_max = max(
+                    0,
+                    int(round(
+                        float(getattr(args, "max_event_backlog_sec", 0.6))
+                        * TARGET_SR / MIMI_FRAME_SIZE
+                    )),
+                )
+                print(
+                    f"[EVENT-BACKLOG] standing-latency cap: {event_backlog_max} events "
+                    f"(~{event_backlog_max * 0.08:.2f}s); 0 disables draining",
+                    flush=True,
+                )
 
                 async def _cancel_stale_media(generation: int) -> None:
                     nonlocal media_epoch
@@ -4265,6 +4320,47 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
                         if suppress_media:
                             continue
+
+                        # -- Standing-backlog drain (logs_4 root cause) -------
+                        # logs_4 measured a rock-steady generated_to_sent_s of
+                        # 9.57/9.43/9.48/9.47/9.32/9.10s across seven turns
+                        # spanning 3.5 minutes, while the avatar renderer sat
+                        # at only ~60% duty. A CONSTANT offset with spare GPU
+                        # headroom is not a throughput problem -- it is a
+                        # fixed-depth queue that filled once and can never
+                        # drain, and persona_event_q is the only unbounded
+                        # queue in the chain (frame_q/audio_q are capped, and
+                        # the GPU thread is held to exactly real-time by
+                        # frame_q backpressure, so it consumes events at the
+                        # same 12.5/s the mic produces them -- it can never
+                        # claw back a backlog on its own). The startup
+                        # transient (cold renderer/JPEG kernels) builds that
+                        # backlog, and every turn afterwards pays it forever.
+                        #
+                        # Dropping SILENT events is the safe way out: an 80ms
+                        # gap in idle avatar animation is inaudible and
+                        # invisible, and it is the only moment where dropping
+                        # cannot cut into speech. Never drops force_idle (the
+                        # thinking sound must stay continuous) and never drops
+                        # while the assistant is actually speaking, so a real
+                        # answer is delivered whole -- the queue simply
+                        # re-levels during the next silence.
+                        if event_backlog_max > 0:
+                            depth = persona_event_q.qsize()
+                            if (
+                                depth > event_backlog_max
+                                and not event_force_idle
+                                and reply_rms <= 0.003
+                            ):
+                                dropped_backlog_events += 1
+                                if dropped_backlog_events % 25 == 1:
+                                    print(
+                                        f"[EVENT-BACKLOG] draining stale silence: depth={depth} "
+                                        f"> max={event_backlog_max} dropped_total={dropped_backlog_events} "
+                                        f"(~{depth * 0.08:.2f}s of standing latency)",
+                                        flush=True,
+                                    )
+                                continue
 
                         with media_generation_lock:
                             event["media_generation"] = int(split_sessions[session_id]["media_generation"])

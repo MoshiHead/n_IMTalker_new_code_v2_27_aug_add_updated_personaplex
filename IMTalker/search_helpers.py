@@ -1226,13 +1226,25 @@ _EMPTY_PAREN_RE = re.compile(r"\(\s*\)")
 _STRAY_SIGNED_NUMBER_RE = re.compile(r"(?<![\w.])([+-])\s?(?=\d)")
 # A lone +/- used as a bullet/separator with no adjacent number at all.
 _STRAY_MATH_SYMBOL_RE = re.compile(r"(?<=\s)[+-](?=\s)")
+# "US$146.19", "A$50", "C$12.30" -- an ISO-ish letter prefix glued to the
+# symbol. Left in place it strands against the replacement words, which is
+# how logs_4 turn 3 produced "USone hundred forty-six dollars and nineteen
+# cents". Keep the symbol (the money patterns still need it), drop the letters.
+_CURRENCY_LETTER_PREFIX_RE = re.compile(r"\b(?:US|AU|NZ|CA|C|A|HK|SG)(?=[$£€¥]\s?\d)")
+# An article stranded in front of an up/down that replaced a +/- sign:
+# "reflecting a +0.23% move" -> "reflecting a up 0.23 percent move".
+_STRANDED_ARTICLE_RE = re.compile(r"\b[Aa]n?\s+(?=(?:up|down)\b)")
+# ...and the noun that only made sense attached to the symbol form.
+_DANGLING_MOVE_RE = re.compile(r"\bpercent\s+(?:move|change|gain|loss)\b")
 
 
-def _compact_money_sub(m: "re.Match[str]") -> str:
+def _compact_money_sub(m: "re.Match[str]", spell_numbers: bool) -> str:
     sign, symbol, num, suffix = m.group(1), m.group(2), m.group(3).replace(",", ""), m.group(4)
     sign_word = {"+": "up ", "-": "down "}.get(sign or "", "")
     scale_word = _COMPACT_SCALE_WORDS[suffix]
     _, plur_major, _, _ = _CURRENCY_WORDS.get(symbol, _CURRENCY_WORDS["$"])
+    if not spell_numbers:
+        return f"{sign_word}{num} {scale_word} {plur_major}"
     if "." in num:
         whole_s, frac_s = num.split(".", 1)
         num_words = f"{_int_to_words(int(whole_s or 0))} point {_spell_digits(frac_s)}"
@@ -1241,7 +1253,7 @@ def _compact_money_sub(m: "re.Match[str]") -> str:
     return f"{sign_word}{num_words} {scale_word} {plur_major}"
 
 
-def _plain_money_sub(m: "re.Match[str]") -> str:
+def _plain_money_sub(m: "re.Match[str]", spell_numbers: bool) -> str:
     sign, symbol, whole_s, frac_s = m.group(1), m.group(2), m.group(3).replace(",", ""), m.group(4)
     sign_word = {"+": "up ", "-": "down "}.get(sign or "", "")
     sing_major, plur_major, sing_minor, plur_minor = _CURRENCY_WORDS.get(symbol, _CURRENCY_WORDS["$"])
@@ -1249,6 +1261,12 @@ def _plain_money_sub(m: "re.Match[str]") -> str:
     if whole >= _MAX_SPOKEN_INT:
         return m.group(0)  # absurdly large -- leave the digits alone
     major_word = sing_major if whole == 1 else plur_major
+    if not spell_numbers:
+        # Keep the numeral EXACTLY as written, drop only the symbol. See
+        # normalize_for_speech's docstring for the logs_3-vs-logs_4 evidence
+        # that spelling the digits out is what corrupted $309.32 into $39.32.
+        amount = f"{whole_s}.{frac_s}" if frac_s else whole_s
+        return f"{sign_word}{amount} {major_word}"
     phrase = f"{sign_word}{_int_to_words(whole)} {major_word}"
     if frac_s and sing_minor:
         cents = int(frac_s.ljust(2, "0")[:2])
@@ -1258,26 +1276,51 @@ def _plain_money_sub(m: "re.Match[str]") -> str:
     return phrase
 
 
-def _percent_sub(m: "re.Match[str]") -> str:
+def _percent_sub(m: "re.Match[str]", spell_numbers: bool) -> str:
     sign, whole_s, frac_s = m.group(1), m.group(2), m.group(3)
     sign_word = {"+": "up ", "-": "down "}.get(sign or "", "")
+    if not spell_numbers:
+        amount = f"{whole_s}.{frac_s}" if frac_s else whole_s
+        return f"{sign_word}{amount} percent"
     whole_words = _int_to_words(int(whole_s))
     if frac_s:
         return f"{sign_word}{whole_words} point {_spell_digits(frac_s)} percent"
     return f"{sign_word}{whole_words} percent"
 
 
-def normalize_for_speech(text: str) -> str:
+def normalize_for_speech(text: str, spell_numbers: bool = False) -> str:
     """Rewrite web-search grounding text into plain spoken English before it
     is handed to PersonaPlex, so the model speaks natural language instead of
     reading symbols aloud (or silently dropping them).
 
-    Deterministic and pure-Python -- no model call, ~microseconds. Only
-    touches patterns unambiguous enough to convert safely (currency amounts,
-    percentages with a recognizable currency/percent symbol, ticker
-    parentheticals, markdown/URL artifacts); a bare number with no symbol is
-    left untouched; per-instruction, blindly spelling out every digit in a
-    sentence makes it LESS natural, not more, so this stays conservative.
+    Deterministic and pure-Python -- no model call, ~microseconds.
+
+    `spell_numbers` defaults to **False**, against the obvious intuition,
+    because two real RunPod runs A/B'd it by accident and the digits won:
+
+      logs_3 turn 6, ref said "...price today is $309.32, reflecting a
+      +0.23% move..."  -> the assistant SPOKE "$309.32, up 0.23%".  Correct.
+      logs_4 turn 4, ref said "...is three hundred nine dollars and
+      thirty-two cents..." -> the assistant SPOKE "$39.32".  Wrong number.
+
+    Spelling the digits out roughly doubles the token count of the injected
+    <ref> (36 -> 42 tokens for the same fact) and turns one unambiguous
+    numeral into a sequence the model has to RE-ASSEMBLE. When the injection
+    smears (see the ref-drain notes in imtalker_personaplex_try_vad2_8998.py)
+    it reassembled "three ... nine ... thirty-two" while dropping the
+    "hundred" magnitude entirely. A shorter ref also smears less and injects
+    faster, so keeping the numeral is better on accuracy AND latency.
+
+    What still always happens (these are pure wins, no downside): the
+    currency/percent SYMBOLS themselves become words ($ -> dollars,
+    % -> percent, +/- -> up/down), ticker parentheses, raw URLs, markdown and
+    table pipes are stripped, and the article/filler grammar left behind by
+    those substitutions is repaired. PersonaPlex re-verbalizes the numeral in
+    its own voice anyway -- logs_4 shows it saying "up 0.23%" no matter which
+    form it was given -- so the numeral's written form costs nothing spoken.
+
+    Pass spell_numbers=True to get the fully spelled-out form
+    ("three hundred nine dollars and thirty-two cents").
     """
     if not text:
         return text
@@ -1285,13 +1328,23 @@ def normalize_for_speech(text: str) -> str:
     out = _URL_RE.sub("", out)
     out = _MARKDOWN_TABLE_PIPE_RE.sub(", ", out)
     out = _SYMBOL_RE.sub("", out)  # markdown emphasis/heading/code marks
-    out = _COMPACT_MONEY_RE.sub(_compact_money_sub, out)
-    out = _PLAIN_MONEY_RE.sub(_plain_money_sub, out)
-    out = _PERCENT_RE.sub(_percent_sub, out)
+    # "US$146.19" / "A$50" / "C$12.30": strip the ISO-ish letter prefix that
+    # would otherwise be left stranded against the substituted words
+    # ("USone hundred forty-six dollars..." -- seen in logs_4 turn 3).
+    out = _CURRENCY_LETTER_PREFIX_RE.sub("", out)
+    out = _COMPACT_MONEY_RE.sub(lambda m: _compact_money_sub(m, spell_numbers), out)
+    out = _PLAIN_MONEY_RE.sub(lambda m: _plain_money_sub(m, spell_numbers), out)
+    out = _PERCENT_RE.sub(lambda m: _percent_sub(m, spell_numbers), out)
     out = _STRAY_SIGNED_NUMBER_RE.sub(lambda m: {"+": "up ", "-": "down "}[m.group(1)], out)
     out = _STRAY_MATH_SYMBOL_RE.sub(",", out)
     out = _TICKER_PAREN_RE.sub("", out)
     out = _EMPTY_PAREN_RE.sub("", out)
+    # -- Grammar repair for what the substitutions above leave behind --------
+    # "reflecting a +0.23% move" becomes "reflecting a up 0.23 percent move":
+    # the article and the trailing noun were grammatical only around the
+    # symbol. Drop the stranded article, then the now-dangling "move".
+    out = _STRANDED_ARTICLE_RE.sub("", out)
+    out = _DANGLING_MOVE_RE.sub("percent", out)
     # Collapse whitespace/punctuation artifacts left behind by the removals
     # above (double spaces, a space before a period, doubled commas).
     out = re.sub(r"\s{2,}", " ", out)

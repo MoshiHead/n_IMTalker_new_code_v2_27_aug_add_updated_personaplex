@@ -94,10 +94,14 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     # keeps running past this point; only the forced silence is released.
     --max_suppress_sec "${MAX_SUPPRESS_SEC:-3.0}"
     # Spread a 20-30 token <ref> injection across several 80ms ticks instead
-    # of blocking the real-time GPU thread for up to ~1.3s in one call
-    # (measured in the same run) -- keeps mic ingestion and avatar rendering
-    # close to their normal cadence during injection.
-    --inject_tokens_per_tick "${INJECT_TOKENS_PER_TICK:-4}"
+    # of blocking the real-time GPU thread in one call -- keeps mic ingestion
+    # and avatar rendering close to their normal cadence during injection.
+    # Raised 4 -> 14 on logs_4 evidence: at 4/tick the ref_inject stage
+    # measured 1.40-2.44s on EVERY search turn (35-46 tokens => ~10 ticks,
+    # each a full 80ms cycle), which is pure added search latency. 14 forced
+    # LM steps cost ~40ms of the 80ms budget (gen_lm was 0.112s for a whole
+    # turn), so this stays inside one tick while cutting the stage to ~3-4.
+    --inject_tokens_per_tick "${INJECT_TOKENS_PER_TICK:-14}"
     # If no real text/audio follows an injection within this many seconds,
     # log it immediately instead of waiting for the next question's VAD to
     # notice minutes later (observed: turn 7 in the same run went silent for
@@ -171,7 +175,7 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
   }
 fi
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="3c630c54e8acfa75910ba47d86a9c4a8347e79c0d1bf3aab243b707da519f183"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="30084f958cbf0e896a673174ee1a516c1578c63f8c11b44d4240c903004f7637"
  ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"
@@ -230,4 +234,5 @@ exec python -u "$IM/imtalker_personaplex_try_vad2_8998.py" \
  --jpeg_quality 90 --device cuda --reply_audio_gain 1.0 --output_audio_codec opus \
  --blink_motion_path "$ROOT/checkpoints/lora/3robert_audio3_ditto_static_motion.pt" --enable_eye_blink_composite \
  --suppress_media_watchdog_sec "${SUPPRESS_MEDIA_WATCHDOG_SEC:-3.0}" \
+ --max_event_backlog_sec "${MAX_EVENT_BACKLOG_SEC:-0.6}" \
  "${SEARCH_ARGS[@]}"
