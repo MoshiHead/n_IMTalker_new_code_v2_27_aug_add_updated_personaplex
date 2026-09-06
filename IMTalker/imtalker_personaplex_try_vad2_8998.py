@@ -4093,6 +4093,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         media_generation = 0
         playback_interrupt_event = threading.Event()
         playback_state = {"active": False, "hold": 0}
+        # Shared A/V clock, written by each sender as it releases a packet and
+        # sampled by the health logger. Both values are "media seconds emitted
+        # since this generation's epoch", so their DIFFERENCE is the real
+        # audio/video offset the user perceives -- the one number that says
+        # whether lip-sync is holding or drifting apart over a long answer.
+        av_clock = {"audio_media_s": 0.0, "video_media_s": 0.0, "generation": 0}
         mic_overlap_packets = 0
         session_started = threading.Event()
         last_mic_level_log_wall = 0.0
@@ -4216,23 +4222,22 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 # Max standing depth of persona_event_q, in events (80ms each),
                 # before stale SILENT events start being dropped. See the drain
                 # block below for why this queue is the one that matters.
-                dropped_backlog_events = 0
                 consecutive_silent_events = 0
                 last_health_log = 0.0
                 _HEALTH_LOG_INTERVAL_S = 5.0
-                # ~1.5s of unbroken silence before any draining is allowed.
+                # ~1.5s of unbroken silence before an idle resync is allowed.
                 _BACKLOG_SILENCE_RUN = int(round(1.5 * TARGET_SR / MIMI_FRAME_SIZE))
                 _BACKLOG_SILENCE_RMS = 0.003
-                event_backlog_max = max(
-                    0,
-                    int(round(
-                        float(getattr(args, "max_event_backlog_sec", 0.6))
-                        * TARGET_SR / MIMI_FRAME_SIZE
-                    )),
-                )
+                # How much queued media (audio OR video, whichever is worse)
+                # counts as standing latency worth reclaiming, and the minimum
+                # spacing between resyncs. See the resync block below.
+                _RESYNC_MAX_LAG_S = max(0.0, float(getattr(args, "max_event_backlog_sec", 0.6)))
+                _RESYNC_MIN_INTERVAL_S = 5.0
+                last_resync_perf = 0.0
+                resync_count = 0
                 print(
-                    f"[EVENT-BACKLOG] standing-latency cap: {event_backlog_max} events "
-                    f"(~{event_backlog_max * 0.08:.2f}s); 0 disables draining",
+                    f"[MEDIA-RESYNC] idle resync threshold: {_RESYNC_MAX_LAG_S:.2f}s of queued media "
+                    f"after ~{_BACKLOG_SILENCE_RUN * 0.08:.1f}s of silence; 0 disables",
                     flush=True,
                 )
 
@@ -4357,59 +4362,92 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         if suppress_media:
                             continue
 
-                        # -- Standing-backlog drain (logs_4 root cause) -------
-                        # logs_4 measured a rock-steady generated_to_sent_s of
-                        # 9.57/9.43/9.48/9.47/9.32/9.10s across seven turns
-                        # spanning 3.5 minutes, while the avatar renderer sat
-                        # at only ~60% duty. A CONSTANT offset with spare GPU
-                        # headroom is not a throughput problem -- it is a
-                        # fixed-depth queue that filled once and can never
-                        # drain, and persona_event_q is the only unbounded
-                        # queue in the chain (frame_q/audio_q are capped, and
-                        # the GPU thread is held to exactly real-time by
-                        # frame_q backpressure, so it consumes events at the
-                        # same 12.5/s the mic produces them -- it can never
-                        # claw back a backlog on its own). The startup
-                        # transient (cold renderer/JPEG kernels) builds that
-                        # backlog, and every turn afterwards pays it forever.
+                        # -- Idle media resync (replaces the logs_5 event drain) --
                         #
-                        # Dropping SILENT events is the safe way out: an 80ms
-                        # gap in idle avatar animation is inaudible and
-                        # invisible, and it is the only moment where dropping
-                        # cannot cut into speech.
+                        # The problem being solved is still the one logs_4
+                        # measured: a standing ~9.4s backlog that forms during
+                        # startup warmup and can never drain, because the GPU
+                        # thread is pinned to exactly real-time by frame_q
+                        # backpressure and so consumes events at the same
+                        # 12.5/s the mic produces them.
                         #
-                        # Only a SUSTAINED run of silence counts as drainable
-                        # idle. A single quiet frame is not idle -- it is the
-                        # gap between two words, or the low-amplitude onset of
-                        # an answer, and dropping those is how a drain starts
-                        # chewing into real speech and pulling the avatar's
-                        # motion window out of alignment with the audio it was
-                        # trained against. Requiring ~1.5s of continuous
-                        # silence means drops only ever land in the dead air
-                        # between turns, where an 80ms gap is inaudible and
-                        # invisible. force_idle (thinking sound / ref mask)
-                        # resets the run: it is not the model being idle.
+                        # The PREVIOUS attempt -- dropping individual silent
+                        # events here -- fixed the latency and broke streaming,
+                        # and the mechanism is worth spelling out because it is
+                        # not obvious. BOTH senders pace off an ABSOLUTE,
+                        # index-derived schedule anchored at media_epoch:
+                        #     audio: epoch + (idx - base) * 0.08
+                        #     video: epoch + idx / fps
+                        # That is only correct while packet INDEX advances in
+                        # lockstep with WALL TIME. Every dropped event removes
+                        # 0.08s of schedule time while removing no wall time,
+                        # so after N drops both senders are N*0.08s behind
+                        # their own epoch -- permanently, since the epoch was
+                        # never re-anchored. Once target_t is in the past the
+                        # two diverge, because their catch-up behaviour
+                        # differs: the audio sender is throttled to one packet
+                        # per min_send_interval_s (0.075s) and therefore drains
+                        # 80ms of audio per 75ms of wall clock -- 6.7% fast,
+                        # forever -- while the video sender had no throttle at
+                        # all and dumped frames back to back. Result: audio
+                        # skipping, frames freezing, and an A/V offset that
+                        # GROWS through every answer and compounds on every
+                        # idle gap. Exactly the "continuous buffering" report.
+                        #
+                        # The correct primitive already exists in this file and
+                        # is proven in the barge-in path: _trigger_media_reset()
+                        # -> _cancel_stale_media() drops BOTH queues atomically,
+                        # sets media_epoch = None so both senders re-anchor to
+                        # ONE common new wall-clock origin via _get_media_epoch(),
+                        # bumps media_generation so stale in-flight packets are
+                        # discarded consistently, and tells the browser to flush
+                        # its own jitter buffer. Latency goes away AND audio and
+                        # video stay on a single timeline, which dropping
+                        # upstream can never achieve.
+                        #
+                        # Fired only after sustained silence, so it always lands
+                        # in the dead air between turns: never mid-answer, and
+                        # never during the thinking sound (force_idle resets the
+                        # run -- the model is not idle then, it is waiting).
                         if event_force_idle or reply_rms > _BACKLOG_SILENCE_RMS:
                             consecutive_silent_events = 0
                         else:
                             consecutive_silent_events += 1
 
-                        if event_backlog_max > 0:
-                            depth = persona_event_q.qsize()
+                        if _RESYNC_MAX_LAG_S > 0.0 and consecutive_silent_events >= _BACKLOG_SILENCE_RUN:
+                            queued_audio_s = (audio_q.qsize() if audio_q is not None else 0) * 0.08
+                            queued_video_s = (
+                                (frame_q.qsize() / float(args.fps)) if frame_q is not None else 0.0
+                            )
+                            standing_lag_s = max(queued_audio_s, queued_video_s)
+                            now_resync = time.perf_counter()
                             if (
-                                depth > event_backlog_max
-                                and consecutive_silent_events >= _BACKLOG_SILENCE_RUN
+                                standing_lag_s > _RESYNC_MAX_LAG_S
+                                and (now_resync - last_resync_perf) > _RESYNC_MIN_INTERVAL_S
                             ):
-                                dropped_backlog_events += 1
-                                if dropped_backlog_events % 25 == 1:
-                                    print(
-                                        f"[EVENT-BACKLOG] draining stale silence: depth={depth} "
-                                        f"> max={event_backlog_max} silent_run={consecutive_silent_events} "
-                                        f"dropped_total={dropped_backlog_events} "
-                                        f"(~{depth * 0.08:.2f}s of standing latency)",
-                                        flush=True,
+                                last_resync_perf = now_resync
+                                resync_count += 1
+                                generation = _trigger_media_reset()
+                                consecutive_silent_events = 0
+                                print(
+                                    f"[MEDIA-RESYNC] idle resync #{resync_count} generation={generation} "
+                                    f"standing_lag={standing_lag_s:.2f}s "
+                                    f"(audio {queued_audio_s:.2f}s / video {queued_video_s:.2f}s) "
+                                    f"-- dropped both queues together and re-anchored the shared "
+                                    f"media epoch",
+                                    flush=True,
+                                )
+                                try:
+                                    runtime_logging.log_event(
+                                        runtime_logging.get_system_logger(), "Pipeline", "media_resync",
+                                        generation=generation,
+                                        standing_lag_s=round(standing_lag_s, 2),
+                                        queued_audio_s=round(queued_audio_s, 2),
+                                        queued_video_s=round(queued_video_s, 2),
+                                        resync_count=resync_count,
                                     )
-                                continue
+                                except Exception:
+                                    pass
 
                         with media_generation_lock:
                             event["media_generation"] = int(split_sessions[session_id]["media_generation"])
@@ -4441,6 +4479,15 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 free_b, total_b = torch.cuda.mem_get_info()
                                 vram_total_gb = round(total_b / 1e9, 2)
                                 vram_used_gb = round((total_b - free_b) / 1e9, 2)
+                            # The headline number: both senders report how many
+                            # MEDIA seconds they have released since the shared
+                            # epoch, so the difference is the actual A/V offset
+                            # the viewer perceives. It should hover near zero
+                            # and, critically, must not GROW during a long
+                            # answer -- that growth is what lip-sync drift is.
+                            av_offset_ms = round(
+                                (av_clock["audio_media_s"] - av_clock["video_media_s"]) * 1000.0, 1
+                            )
                             runtime_logging.log_event(
                                 runtime_logging.get_system_logger(), "Pipeline", "health",
                                 event_q=persona_event_q.qsize(),
@@ -4448,7 +4495,15 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 audio_q=audio_q.qsize() if audio_q is not None else -1,
                                 mic_q=mic_q.qsize() if mic_q is not None else -1,
                                 event_q_latency_s=round(persona_event_q.qsize() * 0.08, 2),
-                                dropped_backlog_events=dropped_backlog_events,
+                                audio_q_latency_s=round((audio_q.qsize() if audio_q is not None else 0) * 0.08, 2),
+                                video_q_latency_s=round(
+                                    (frame_q.qsize() if frame_q is not None else 0) / float(args.fps), 2
+                                ),
+                                av_offset_ms=av_offset_ms,
+                                audio_media_s=round(av_clock["audio_media_s"], 2),
+                                video_media_s=round(av_clock["video_media_s"], 2),
+                                media_generation=av_clock["generation"],
+                                resync_count=resync_count,
                                 suppressed=bool(suppress_media),
                                 vram_used_gb=vram_used_gb,
                                 vram_total_gb=vram_total_gb,
@@ -4925,6 +4980,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 starvation_events = 0
                 starve_start: float | None = None
                 ws_closed = False
+                # Same anti-burst contract the audio sender uses, one frame
+                # period minus a small slack so normal pacing is never slowed.
+                native_frame_sec = 1.0 / float(args.fps)
+                min_frame_interval_s = max(0.001, native_frame_sec - 0.005)
+                next_frame_wall = send_start_wall
+                active_generation = 0
+                base_frame_idx: int | None = None
+                dropped_stale_frames = 0
 
                 q_depth_at_start = frame_q.qsize()
                 print(
@@ -4960,12 +5023,56 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             )
                         starve_start = None
 
+                    # -- Generation filtering + epoch re-anchoring ------------
+                    # The audio sender has always done both of these; this one
+                    # did neither, which meant that after ANY media reset
+                    # (a barge-in, or the idle resync) audio restarted its
+                    # timeline at a fresh epoch with a rebased packet index
+                    # while video kept the ORIGINAL epoch and an absolute frame
+                    # counter that never rebased. The two clocks then diverge
+                    # without bound -- the mouth drifts further behind the
+                    # voice the longer the session runs, and stale frames from
+                    # a cancelled generation are still painted. Audio and video
+                    # must re-anchor to the SAME new origin, together.
+                    session = split_sessions.get(session_id)
+                    if session is None:
+                        break
+                    packet_generation = int(packet.get("media_generation", 0))
+                    if packet_generation != _media_generation(session):
+                        dropped_stale_frames += 1
+                        continue
                     idx = int(packet["frame_number"])
+                    if packet_generation != active_generation or base_frame_idx is None:
+                        active_generation = packet_generation
+                        base_frame_idx = idx
+                        send_start_wall = await _get_media_epoch()
+                        next_frame_wall = send_start_wall
+                        print(
+                            f"[MEDIA-EPOCH][VIDEO] generation={active_generation} "
+                            f"base_frame={base_frame_idx}",
+                            flush=True,
+                        )
+                    idx = idx - base_frame_idx
 
+                    # Anti-burst floor, mirroring the audio sender's
+                    # min_send_interval_s. Without it, any moment where
+                    # target_t has fallen into the past (a render stall, a GPU
+                    # hiccup, an idle media resync) made this loop dump every
+                    # queued frame back to back as fast as the websocket would
+                    # take them -- the browser sees a burst, then starvation,
+                    # then another burst, which is seen as the video freezing
+                    # and jumping while the audio (which IS throttled) keeps
+                    # its own pace. The two paths must degrade the same way or
+                    # they drift apart precisely when the pipeline is already
+                    # under stress.
                     target_t = send_start_wall + idx / float(args.fps)
+                    target_t = max(target_t, next_frame_wall)
                     sleep_s = target_t - time.perf_counter()
                     if sleep_s > 0:
                         await asyncio.sleep(sleep_s)
+                    next_frame_wall = max(target_t, time.perf_counter()) + min_frame_interval_s
+                    av_clock["video_media_s"] = idx * native_frame_sec
+                    av_clock["generation"] = active_generation
 
                     try:
                         async with ws_send_lock:
@@ -5055,6 +5162,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     last_send_wall = send_wall
                     next_send_wall = max(target_t, send_wall) + min_send_interval_s
                     max_queue_depth = max(max_queue_depth, audio_q.qsize())
+                    av_clock["audio_media_s"] = (idx - base_audio_idx) * native_packet_sec
 
                     audio_pcm = np.asarray(
                         packet["audio_pcm"],
